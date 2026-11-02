@@ -1,0 +1,14 @@
+{
+  "_comment": "Edit this file to change what the AI looks for. Each label's haptic code is its position in the list (1st label = 1 long buzz, 2nd = 2 long buzzes, ...). Keep it to 5 labels or fewer so the buzz counts stay easy to feel.",
+  "question": "What is the main subject in the center of this photo?",
+  "labels": [
+    {"label": "person",  "description": "One or more people are the main subject."},
+    {"label": "vehicle", "description": "A car, bike, bus, truck or other vehicle is the main subject."},
+    {"label": "animal",  "description": "An animal or pet is the main subject."},
+    {"label": "food",    "description": "Food or drink is the main subject."},
+    {"label": "other",   "description": "Something clearly visible that is none of the above."}
+  ],
+  "min_agreement": 2,
+  "model": "claude-opus-5-5",
+  "effort": "low"
+}
