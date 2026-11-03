@@ -43,6 +43,12 @@ const int      SHOTS       = 8;
 const int      KEEP        = 4;
 const int      SHOT_GAP_MS = 150;      // small gap -> slightly different frames
 const uint32_t WARMUP_MS   = 1200;     // auto-exposure settle time after powering the camera
+
+// Heat guard (ESP32-S3 internal sensor, approximate). Type T in the Serial Monitor to read it.
+const float TEMP_WARN_C   = 70.0;      // above this: live view is switched off / refused
+const float TEMP_STOP_C   = 80.0;      // above this: jobs are refused (user gets retake buzz)
+const float TEMP_RESUME_C = 70.0;      // jobs allowed again once it cools below this
+const uint32_t TEMP_PRINT_MS = 30000;  // how often to print the temperature
 const int      MIN_UPLOADS = 3;        // server needs 3/4 agreement anyway
 const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is max for OV3660
 const framesize_t STREAM_FRAME = FRAMESIZE_VGA;  // live view: 640x480 keeps it smooth
@@ -195,8 +201,15 @@ void streamCameraOff() {
   xSemaphoreGive(camLock);
 }
 
+float chipTemp = 0;     // latest reading, updated by checkTemp()
+bool tooHot = false;    // true from TEMP_STOP_C until it cools below TEMP_RESUME_C
+
 void startLiveView() {
   if (WiFi.status() != WL_CONNECTED) { Serial.println("live view needs Wi-Fi"); return; }
+  if (chipTemp >= TEMP_WARN_C) {
+    Serial.printf("live view refused: board is %.0f C, let it cool below %.0f C\n", chipTemp, TEMP_WARN_C);
+    return;
+  }
   if (!streaming) {
     startServers();
     streamCameraOn();
@@ -443,12 +456,42 @@ void setup() {
   Serial.println("camera board ready. Type F for live view, G to stop it.");
 }
 
+// Reads the chip temperature every 2 s and applies the heat guard.
+void checkTemp() {
+  static uint32_t lastRead = 0, lastPrint = 0;
+  if (lastRead && millis() - lastRead < 2000) return;
+  lastRead = millis();
+  chipTemp = temperatureRead();
+
+  if (streaming && chipTemp >= TEMP_WARN_C) {
+    Serial.printf("HEAT: %.0f C, turning live view off\n", chipTemp);
+    stopLiveView();
+  }
+  if (!tooHot && chipTemp >= TEMP_STOP_C) {
+    tooHot = true;
+    Serial.printf("HEAT: %.0f C, refusing jobs until below %.0f C\n", chipTemp, TEMP_RESUME_C);
+  } else if (tooHot && chipTemp < TEMP_RESUME_C) {
+    tooHot = false;
+    Serial.printf("HEAT: cooled to %.0f C, jobs allowed again\n", chipTemp);
+  }
+  if (millis() - lastPrint >= TEMP_PRINT_MS) {
+    lastPrint = millis();
+    Serial.printf("temp: %.0f C%s\n", chipTemp, tooHot ? " (too hot, jobs paused)" : "");
+  }
+}
+
 void loop() {
   ensureWifi();
   ws.loop();
+  checkTemp();
   if (pendingJob.length()) {
     String id = pendingJob;
     pendingJob = "";
+    if (tooHot) {
+      Serial.printf("job %s refused: board is %.0f C\n", id.c_str(), chipTemp);
+      reportFail(id, "too hot");   // button board plays the retake pattern
+      return;
+    }
     bool wasStreaming = streaming;
     if (wasStreaming) streamCameraOff();   // full-res capture needs the camera to itself
     runJob(id);
@@ -461,5 +504,7 @@ void loop() {
     char c = Serial.read();
     if (c == 'F' || c == 'f') startLiveView();
     else if (c == 'G' || c == 'g') stopLiveView();
+    else if (c == 'T' || c == 't') Serial.printf("temp: %.0f C%s\n", temperatureRead(),
+                                                 tooHot ? " (too hot, jobs paused)" : "");
   }
 }

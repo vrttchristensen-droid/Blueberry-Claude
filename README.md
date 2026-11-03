@@ -39,6 +39,12 @@ browser on the same Wi-Fi. Type **G** to stop. Button presses still work during 
 pauses, the 8 full-resolution photos are taken, and the stream resumes. The board runs warm while
 live view is on.
 
+### Heat guard (camera board)
+The camera board reads its chip temperature (approximate) every 2 s and prints it every 30 s;
+type **T** to print it now. Above 70 °C live view is switched off and refused. Above 80 °C new jobs
+are refused (the button gives the retake buzz, server log reason "too hot") until it cools below
+70 °C. Thresholds are `TEMP_WARN_C`, `TEMP_STOP_C`, `TEMP_RESUME_C` near the top of the sketch.
+
 ### Button board
 Wiring and libraries are at the top of `button_board/button_board.ino`. Set Wi-Fi, `SERVER`,
 `DEVICE_KEY`, and `MOTOR_IS_LRA` to match your motor.
