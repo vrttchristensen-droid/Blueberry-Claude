@@ -33,6 +33,7 @@ const char* DEVICE_KEY = "change-me";
 const int      SHOTS       = 8;
 const int      KEEP        = 4;
 const int      SHOT_GAP_MS = 150;      // small gap -> slightly different frames
+const uint32_t WARMUP_MS   = 1200;     // auto-exposure settle time after powering the camera
 const int      MIN_UPLOADS = 3;        // server needs 3/4 agreement anyway
 const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is max for OV3660
 
@@ -189,8 +190,12 @@ void runJob(const String& id) {
   SD.mkdir("/jobs");
   SD.mkdir(dir);
 
-  // Drop stale buffered frames so exposure/focus reflect "now"
-  for (int i = 0; i < 2; i++) {
+  // Camera is powered only while capturing (it runs very hot if left streaming)
+  if (!initCamera()) { reportFail(id, "camera init failed"); return; }
+
+  // Let auto-exposure / white balance settle before the real shots
+  uint32_t warm = millis();
+  while (millis() - warm < WARMUP_MS) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
@@ -216,6 +221,7 @@ void runJob(const String& id) {
     esp_camera_fb_return(fb);
     delay(SHOT_GAP_MS);
   }
+  esp_camera_deinit();  // camera off again; uploads don't need it
 
   // Rank indices by sharpness, best first
   int order[SHOTS];
@@ -251,12 +257,13 @@ void runJob(const String& id) {
 // ------------------------------------------------------------ setup / loop
 void setup() {
   Serial.begin(115200);
-  if (!initCamera()) { delay(3000); ESP.restart(); }
+  if (!initCamera()) { delay(3000); ESP.restart(); }  // check the camera works...
+  esp_camera_deinit();                                  // ...then keep it off until a job
   if (!SD.begin(SD_CS)) { Serial.println("SD mount failed (FAT32?)"); delay(3000); ESP.restart(); }
 
   tls.setInsecure();  // proof of concept: skips certificate check (see README)
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);  // faster response to new jobs
+  WiFi.setSleep(true);   // modem sleep: much cooler, long-poll still works
   ensureWifi(15000);
   Serial.println("camera board ready");
 }
