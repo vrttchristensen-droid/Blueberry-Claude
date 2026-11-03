@@ -93,15 +93,13 @@ void hapticAnswer(int index) {                       // 1-based
 
 // ------------------------------------------------------------ network
 bool tryNetwork(const WifiNet& n, uint32_t timeoutMs) {
-  Serial.printf("Wi-Fi: trying \"%s\"...
-", n.ssid);
+  Serial.printf("Wi-Fi: trying \"%s\"...\n", n.ssid);
   WiFi.disconnect();
   WiFi.begin(n.ssid, n.pass);
   uint32_t t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
   if (WiFi.status() != WL_CONNECTED) return false;
-  Serial.printf("Wi-Fi: connected to \"%s\", IP %s
-", n.ssid, WiFi.localIP().toString().c_str());
+  Serial.printf("Wi-Fi: connected to \"%s\", IP %s\n", n.ssid, WiFi.localIP().toString().c_str());
   return true;
 }
 
