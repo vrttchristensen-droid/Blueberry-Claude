@@ -26,10 +26,16 @@
 #include <SPI.h>
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
+#include "esp_http_server.h"
 
 // ------------------------------------------------------------ config
-const char* WIFI_SSID  = "your-ssid";
-const char* WIFI_PASS  = "your-password";
+// Wi-Fi networks in priority order: the first one in range wins. Add or remove lines freely.
+struct WifiNet { const char* ssid; const char* pass; };
+WifiNet WIFI_NETWORKS[] = {
+  {"your-ssid",         "your-password"},   // 1st choice
+  {"your-phone-hotspot", "hotspot-password"}, // 2nd choice
+};
+const int WIFI_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 const char* SERVER     = "https://your-service.onrender.com";
 const char* DEVICE_KEY = "change-me";
 
@@ -39,6 +45,7 @@ const int      SHOT_GAP_MS = 150;      // small gap -> slightly different frames
 const uint32_t WARMUP_MS   = 1200;     // auto-exposure settle time after powering the camera
 const int      MIN_UPLOADS = 3;        // server needs 3/4 agreement anyway
 const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is max for OV3660
+const framesize_t STREAM_FRAME = FRAMESIZE_VGA;  // live view: 640x480 keeps it smooth
 
 #define SD_CS 21
 
@@ -65,7 +72,7 @@ WebSocketsClient ws;
 String pendingJob;   // set by the WebSocket handler, run from loop()
 
 // ------------------------------------------------------------ camera
-bool initCamera() {
+bool initCamera(framesize_t size = FRAME) {
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_0;
   c.ledc_timer   = LEDC_TIMER_0;
@@ -83,8 +90,8 @@ bool initCamera() {
   c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size   = FRAME;
-  c.jpeg_quality = 10;              // lower = better quality, bigger file
+  c.frame_size   = size;
+  c.jpeg_quality = (size == FRAME) ? 10 : 12;  // lower = better quality, bigger file
   c.fb_count     = 2;
   c.fb_location  = CAMERA_FB_IN_PSRAM;
   c.grab_mode    = CAMERA_GRAB_LATEST;
@@ -102,6 +109,112 @@ bool initCamera() {
     s->set_saturation(s, -2);       // text doesn't need color
   }
   return true;
+}
+
+// ------------------------------------------------------------ live view (type F = start, G = stop)
+// Serves a page on http://<board-ip>/ with an MJPEG stream from port 81.
+// A job during live view pauses the stream, captures at full resolution, then resumes it.
+volatile bool streaming = false;   // live view mode on
+volatile bool camOn = false;       // camera running in live-view resolution
+SemaphoreHandle_t camLock;         // guards camera on/off vs. the stream task
+httpd_handle_t pageServer = NULL, streamServer = NULL;
+const size_t STREAM_BUF = 200 * 1024;
+
+#define PART_BOUNDARY "frameboundary8675309"
+static const char* STREAM_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* STREAM_SEP  = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+esp_err_t pageHandler(httpd_req_t* req) {
+  String ip = WiFi.localIP().toString();
+  String html =
+    "<!doctype html><html><head><meta name=viewport content='width=device-width'>"
+    "<title>Camera live view</title><style>body{margin:0;background:#111;color:#bbb;"
+    "font-family:sans-serif;text-align:center}img{max-width:100%;height:auto}</style></head><body>"
+    "<p>Live view. Type G in the Serial Monitor to stop. It freezes for a moment while a job captures.</p>"
+    "<img src='http://" + ip + ":81/stream'></body></html>";
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+esp_err_t streamHandler(httpd_req_t* req) {
+  if (!streaming) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "Live view is off. Type F in the Serial Monitor.");
+  }
+  uint8_t* frame = (uint8_t*)heap_caps_malloc(STREAM_BUF, MALLOC_CAP_SPIRAM);
+  if (!frame) return httpd_resp_send_500(req);
+  httpd_resp_set_type(req, STREAM_TYPE);
+
+  while (streaming) {
+    size_t len = 0;
+    xSemaphoreTake(camLock, portMAX_DELAY);
+    if (camOn) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) {
+        if (fb->len <= STREAM_BUF) { memcpy(frame, fb->buf, fb->len); len = fb->len; }
+        esp_camera_fb_return(fb);
+      }
+    }
+    xSemaphoreGive(camLock);
+    if (!len) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }  // paused for a job
+
+    char hdr[64];
+    int hlen = snprintf(hdr, sizeof hdr, STREAM_PART, (unsigned)len);
+    if (httpd_resp_send_chunk(req, STREAM_SEP, strlen(STREAM_SEP)) != ESP_OK) break;
+    if (httpd_resp_send_chunk(req, hdr, hlen) != ESP_OK) break;
+    if (httpd_resp_send_chunk(req, (const char*)frame, len) != ESP_OK) break;  // browser closed
+  }
+  heap_caps_free(frame);
+  return ESP_OK;
+}
+
+void startServers() {
+  if (pageServer) return;
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 80;
+  cfg.ctrl_port = 32768;
+  httpd_uri_t page = {.uri = "/", .method = HTTP_GET, .handler = pageHandler, .user_ctx = NULL};
+  if (httpd_start(&pageServer, &cfg) == ESP_OK) httpd_register_uri_handler(pageServer, &page);
+
+  cfg.server_port = 81;
+  cfg.ctrl_port = 32769;
+  httpd_uri_t stream = {.uri = "/stream", .method = HTTP_GET, .handler = streamHandler, .user_ctx = NULL};
+  if (httpd_start(&streamServer, &cfg) == ESP_OK) httpd_register_uri_handler(streamServer, &stream);
+}
+
+void streamCameraOn() {
+  xSemaphoreTake(camLock, portMAX_DELAY);
+  if (!camOn && initCamera(STREAM_FRAME)) camOn = true;
+  xSemaphoreGive(camLock);
+}
+
+void streamCameraOff() {
+  xSemaphoreTake(camLock, portMAX_DELAY);
+  if (camOn) { esp_camera_deinit(); camOn = false; }
+  xSemaphoreGive(camLock);
+}
+
+void startLiveView() {
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("live view needs Wi-Fi"); return; }
+  if (!streaming) {
+    startServers();
+    streamCameraOn();
+    if (!camOn) { Serial.println("live view: camera failed to start"); return; }
+    WiFi.setSleep(false);  // full Wi-Fi speed for video
+    streaming = true;
+  }
+  Serial.printf("LIVE VIEW ON: open http://%s/ in a browser on the same Wi-Fi. Type G to stop.\n",
+                WiFi.localIP().toString().c_str());
+}
+
+void stopLiveView() {
+  if (!streaming) return;
+  streaming = false;
+  delay(200);              // let the stream task notice and let go of the camera
+  streamCameraOff();
+  WiFi.setSleep(true);
+  Serial.println("live view off");
 }
 
 // Variance of the Laplacian on the green channel of a half-res decode.
@@ -136,13 +249,36 @@ float sharpness(camera_fb_t* fb) {
 }
 
 // ------------------------------------------------------------ network
+bool tryNetwork(const WifiNet& n, uint32_t timeoutMs) {
+  Serial.printf("Wi-Fi: trying \"%s\"...
+", n.ssid);
+  WiFi.disconnect();
+  WiFi.begin(n.ssid, n.pass);
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
+  if (WiFi.status() != WL_CONNECTED) return false;
+  Serial.printf("Wi-Fi: connected to \"%s\", IP %s
+", n.ssid, WiFi.localIP().toString().c_str());
+  return true;
+}
+
+// Connects to the highest-priority network that's in range.
 bool ensureWifi(uint32_t timeoutMs = 10000) {
   if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
-  return WiFi.status() == WL_CONNECTED;
+  int found = WiFi.scanNetworks();
+  bool visible[WIFI_COUNT] = {};
+  for (int j = 0; j < found; j++)
+    for (int i = 0; i < WIFI_COUNT; i++)
+      if (WiFi.SSID(j) == WIFI_NETWORKS[i].ssid) visible[i] = true;
+  WiFi.scanDelete();
+
+  for (int i = 0; i < WIFI_COUNT; i++)             // in range, in priority order
+    if (visible[i] && tryNetwork(WIFI_NETWORKS[i], timeoutMs)) return true;
+  for (int i = 0; i < WIFI_COUNT; i++)             // hidden networks don't show in scans
+    if (!visible[i] && tryNetwork(WIFI_NETWORKS[i], timeoutMs)) return true;
+  Serial.println("Wi-Fi: no listed network could be joined");
+  return false;
 }
 
 int httpJson(const char* method, const String& path, const String& body, String& out,
@@ -288,6 +424,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
 // ------------------------------------------------------------ setup / loop
 void setup() {
   Serial.begin(115200);
+  camLock = xSemaphoreCreateMutex();
   if (!initCamera()) { delay(3000); ESP.restart(); }  // check the camera works...
   esp_camera_deinit();                                  // ...then keep it off until a job
   if (!SD.begin(SD_CS)) { Serial.println("SD mount failed (FAT32?)"); delay(3000); ESP.restart(); }
@@ -305,7 +442,7 @@ void setup() {
   ws.onEvent(onWsEvent);
   ws.setReconnectInterval(3000);
   ws.enableHeartbeat(15000, 5000, 2);   // ping every 15 s; drop + reconnect if 2 pongs missed
-  Serial.println("camera board ready");
+  Serial.println("camera board ready. Type F for live view, G to stop it.");
 }
 
 void loop() {
@@ -314,8 +451,17 @@ void loop() {
   if (pendingJob.length()) {
     String id = pendingJob;
     pendingJob = "";
+    bool wasStreaming = streaming;
+    if (wasStreaming) streamCameraOff();   // full-res capture needs the camera to itself
     runJob(id);
+    if (wasStreaming && streaming) streamCameraOn();
     String done = "{\"event\":\"job_finished\",\"job_id\":\"" + id + "\"}";
     ws.sendTXT(done);
+  }
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'F' || c == 'f') startLiveView();
+    else if (c == 'G' || c == 'g') stopLiveView();
   }
 }

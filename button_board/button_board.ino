@@ -29,8 +29,13 @@
 #include <ArduinoJson.h>
 
 // ------------------------------------------------------------ config
-const char* WIFI_SSID   = "your-ssid";
-const char* WIFI_PASS   = "your-password";
+// Wi-Fi networks in priority order: the first one in range wins. Add or remove lines freely.
+struct WifiNet { const char* ssid; const char* pass; };
+WifiNet WIFI_NETWORKS[] = {
+  {"your-ssid",         "your-password"},   // 1st choice
+  {"your-phone-hotspot", "hotspot-password"}, // 2nd choice
+};
+const int WIFI_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 const char* SERVER      = "https://your-service.onrender.com";  // no trailing slash
 const char* DEVICE_KEY  = "change-me";                          // must match server
 
@@ -87,13 +92,36 @@ void hapticAnswer(int index) {                       // 1-based
 }
 
 // ------------------------------------------------------------ network
+bool tryNetwork(const WifiNet& n, uint32_t timeoutMs) {
+  Serial.printf("Wi-Fi: trying \"%s\"...
+", n.ssid);
+  WiFi.disconnect();
+  WiFi.begin(n.ssid, n.pass);
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
+  if (WiFi.status() != WL_CONNECTED) return false;
+  Serial.printf("Wi-Fi: connected to \"%s\", IP %s
+", n.ssid, WiFi.localIP().toString().c_str());
+  return true;
+}
+
+// Connects to the highest-priority network that's in range.
 bool ensureWifi(uint32_t timeoutMs = 10000) {
   if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
-  return WiFi.status() == WL_CONNECTED;
+  int found = WiFi.scanNetworks();
+  bool visible[WIFI_COUNT] = {};
+  for (int j = 0; j < found; j++)
+    for (int i = 0; i < WIFI_COUNT; i++)
+      if (WiFi.SSID(j) == WIFI_NETWORKS[i].ssid) visible[i] = true;
+  WiFi.scanDelete();
+
+  for (int i = 0; i < WIFI_COUNT; i++)             // in range, in priority order
+    if (visible[i] && tryNetwork(WIFI_NETWORKS[i], timeoutMs)) return true;
+  for (int i = 0; i < WIFI_COUNT; i++)             // hidden networks don't show in scans
+    if (!visible[i] && tryNetwork(WIFI_NETWORKS[i], timeoutMs)) return true;
+  Serial.println("Wi-Fi: no listed network could be joined");
+  return false;
 }
 
 int httpRequest(const char* method, const String& path, const String& body, String& out) {

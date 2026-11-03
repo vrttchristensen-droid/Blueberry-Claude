@@ -29,6 +29,16 @@ Optional env vars: `CLAUDE_MODEL`, `JOB_TIMEOUT_S` (90), `RESULT_HOLD_S` (120).
 
 Opening the service URL shows `camera_connected: true` when the camera board's WebSocket is up.
 
+### Wi-Fi networks (both boards)
+At the top of each sketch, `WIFI_NETWORKS` lists networks in priority order. On connect the board
+scans and joins the highest one in range. Add or remove lines as needed.
+
+### Live view (camera board)
+In the camera board's Serial Monitor type **F**: it prints `http://<board-ip>/`. Open that in a
+browser on the same Wi-Fi. Type **G** to stop. Button presses still work during live view: the stream
+pauses, the 8 full-resolution photos are taken, and the stream resumes. The board runs warm while
+live view is on.
+
 ### Button board
 Wiring and libraries are at the top of `button_board/button_board.ino`. Set Wi-Fi, `SERVER`,
 `DEVICE_KEY`, and `MOTOR_IS_LRA` to match your motor.
