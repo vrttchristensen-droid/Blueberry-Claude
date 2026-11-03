@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SD.h>
@@ -27,7 +28,9 @@
 #define WIFI_SSID      "your-wifi"
 #define WIFI_PASSWORD  "your-password"
 
-#define SERVER_URL     "http://192.168.1.50:8000"   // no trailing slash
+// Your server address, no trailing slash. Render example: "https://haptic-camera.onrender.com"
+// A server on your own network works too, e.g. "http://192.168.1.50:8000"
+#define SERVER_URL     "https://your-app-name.onrender.com"
 #define API_KEY        "change-me"                  // must match DEVICE_API_KEY on the server
 #define CAMERA_ID      "camera-1"
 
@@ -149,6 +152,22 @@ float measureSharpness(const camera_fb_t *fb) {
   return (float)(sumSq / n - mean * mean);
 }
 
+// ------------------------------------------------------------------ http(s)
+
+// Works with both http:// (local server) and https:// (e.g. Render.com) addresses.
+// setInsecure() skips certificate checking: traffic is still encrypted, but the board
+// does not verify it is talking to the real server. Fine for a hobby project.
+WiFiClient plainClient;
+WiFiClientSecure secureClient;
+
+bool beginHttp(HTTPClient &http, const String &url) {
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    return http.begin(secureClient, url);
+  }
+  return http.begin(plainClient, url);
+}
+
 // ------------------------------------------------------------------ network
 
 bool ensureWifi(uint32_t timeoutMs = 15000) {
@@ -169,7 +188,7 @@ bool ensureWifi(uint32_t timeoutMs = 15000) {
 int postJson(const String &path, const String &body, String *out = nullptr) {
   HTTPClient http;
   http.setTimeout(10000);
-  if (!http.begin(String(SERVER_URL) + path)) return -1;
+  if (!beginHttp(http, String(SERVER_URL) + path)) return -1;
   http.addHeader("X-API-Key", API_KEY);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
@@ -191,7 +210,7 @@ void reportFailure(const String &jobId, const String &reason) {
 bool claimJob(String &jobId, int &numCaptures, int &numUpload) {
   HTTPClient http;
   http.setTimeout(30000);
-  if (!http.begin(String(SERVER_URL) + "/api/jobs/claim?wait=20&camera_id=" + CAMERA_ID)) return false;
+  if (!beginHttp(http, String(SERVER_URL) + "/api/jobs/claim?wait=20&camera_id=" + CAMERA_ID)) return false;
   http.addHeader("X-API-Key", API_KEY);
   int code = http.GET();
   bool ok = false;
@@ -217,7 +236,7 @@ bool uploadShot(const String &jobId, int rank, const Shot &s) {
     http.setTimeout(20000);
     String url = String(SERVER_URL) + "/api/jobs/" + jobId + "/images?rank=" + rank +
                  "&shot=" + s.index + "&sharpness=" + String(s.sharpness, 1);
-    if (!http.begin(url)) continue;
+    if (!beginHttp(http, url)) continue;
     http.addHeader("X-API-Key", API_KEY);
     http.addHeader("Content-Type", "image/jpeg");
     int code = http.POST(s.buf, s.len);

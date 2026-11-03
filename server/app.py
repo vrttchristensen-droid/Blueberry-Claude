@@ -296,6 +296,12 @@ class NewJob(BaseModel):
     battery_v: Optional[float] = None
 
 
+@app.get("/")
+async def home():
+    return {"ok": True, "message": "Haptic camera server is running", "analyzer": ANALYZER,
+            "labels": [l["label"] for l in CONFIG["labels"]]}
+
+
 @app.get("/api/health")
 async def health():
     return {"ok": True, "jobs": len(jobs)}

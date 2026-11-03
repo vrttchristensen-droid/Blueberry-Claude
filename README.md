@@ -1,5 +1,7 @@
 # Blueberry: haptic camera
 
+> **New here? Follow [SETUP_GUIDE.md](SETUP_GUIDE.md).** It covers everything step by step, including hosting the server on Render.com.
+
 You press a button on a wearable. A second board with a camera takes a burst of photos. A server asks Claude what's in them. The answer comes back to your wrist as a vibration pattern.
 
 ```
@@ -112,6 +114,6 @@ Every request needs the `X-API-Key` header.
 
 ## Notes and limits
 
-- The boards talk plain HTTP, so keep the server on your LAN. To reach it over the internet, put it behind HTTPS and switch the firmware to `WiFiClientSecure` with your server's CA certificate.
+- The boards work with `http://` (server on your own network) and `https://` (e.g. Render.com). For HTTPS they encrypt traffic but skip certificate checking (`setInsecure()`). To harden that, load your host's CA certificate into `secureClient`.
 - Job state is held in memory, so restarting the server drops in-flight jobs. The button then times out and buzzes ERROR.
 - With one camera, jobs run one at a time in press order. Extra cameras just need unique `CAMERA_ID`s.

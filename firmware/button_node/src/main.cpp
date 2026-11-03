@@ -25,6 +25,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Adafruit_DRV2605.h>
 #include <Adafruit_MAX1704X.h>
@@ -116,6 +117,22 @@ void patternBatteryLevel() {
   for (int i = 0; i < pulses; i++) { buzz(200, 0x60); delay(250); }
 }
 
+// ------------------------------------------------------------------ http(s)
+
+// Works with both http:// (local server) and https:// (e.g. Render.com) addresses.
+// setInsecure() skips certificate checking: traffic is still encrypted, but the board
+// does not verify it is talking to the real server. Fine for a hobby project.
+WiFiClient plainClient;
+WiFiClientSecure secureClient;
+
+bool beginHttp(HTTPClient &http, const String &url) {
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    return http.begin(secureClient, url);
+  }
+  return http.begin(plainClient, url);
+}
+
 // ------------------------------------------------------------------ network
 
 bool ensureWifi(uint32_t timeoutMs = 15000) {
@@ -137,7 +154,7 @@ int httpRequest(const char *method, const String &path, const String &body, Stri
   HTTPClient http;
   http.setTimeout(timeoutMs);
   http.setConnectTimeout(5000);
-  if (!http.begin(String(SERVER_URL) + path)) return -1;
+  if (!beginHttp(http, String(SERVER_URL) + path)) return -1;
   http.addHeader("X-API-Key", API_KEY);
   int code;
   if (strcmp(method, "POST") == 0) {

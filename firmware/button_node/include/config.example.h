@@ -5,8 +5,9 @@
 #define WIFI_SSID      "your-wifi"
 #define WIFI_PASSWORD  "your-password"
 
-// Render server base URL (no trailing slash). Plain HTTP on your LAN.
-#define SERVER_URL     "http://192.168.1.50:8000"
+// Your server address, no trailing slash. Render example: "https://haptic-camera.onrender.com"
+// A server on your own network works too, e.g. "http://192.168.1.50:8000"
+#define SERVER_URL     "https://your-app-name.onrender.com"
 #define API_KEY        "change-me"     // must match DEVICE_API_KEY on the server
 #define DEVICE_ID      "button-1"
 
