@@ -2,8 +2,10 @@
 Render server for the button -> camera -> vision -> haptic proof of concept.
 
 Flow
-  1. Button board  POST /button              -> creates the single active job (409 if one exists)
-  2. Camera board  GET  /camera/next         -> long-polls, claims the pending job
+  0. Camera board  WS   /camera/ws           -> stays connected; server pushes jobs down it
+  1. Button board  POST /button              -> creates the single active job (409 if one exists,
+                                                503 if the camera isn't connected) and sends
+                                                {"cmd":"capture","job_id":...} to the camera
   3. Camera board  POST /camera/{id}/image/{rank}  (x4, raw JPEG body)
   4. Camera board  POST /camera/{id}/submit  -> server reads all 4 images in parallel, votes
   5. Button board  GET  /job/{id}            -> polls; when status == "done" it gets the result
@@ -22,7 +24,7 @@ import uuid
 from collections import Counter
 
 from anthropic import AsyncAnthropic
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mcq")
@@ -31,9 +33,7 @@ log = logging.getLogger("mcq")
 DEVICE_KEY = os.environ.get("DEVICE_KEY", "")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 JOB_TIMEOUT_S = float(os.environ.get("JOB_TIMEOUT_S", "90"))      # whole job, press -> result
-CLAIM_TIMEOUT_S = float(os.environ.get("CLAIM_TIMEOUT_S", "15"))  # camera must claim within this
 RESULT_HOLD_S = float(os.environ.get("RESULT_HOLD_S", "120"))     # uncollected result auto-closes
-LONG_POLL_S = float(os.environ.get("LONG_POLL_S", "25"))          # camera long-poll window
 REQUIRED_AGREEMENT = 3
 IMAGES_EXPECTED = 4
 MAX_IMAGE_BYTES = 3_000_000
@@ -59,6 +59,7 @@ client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
 app = FastAPI()
 lock = asyncio.Lock()
 job: dict | None = None    # the single active job
+camera_ws: WebSocket | None = None  # the camera board's live connection
 _tasks: set = set()        # keep references to background analysis tasks
 
 
@@ -97,9 +98,7 @@ def _expire_locked() -> None:
             log.warning("job %s result never collected; closing", job["id"])
             job = None
         return
-    if job["status"] == "pending" and now - job["created"] > CLAIM_TIMEOUT_S:
-        _finish_locked("error", "camera never claimed the job")
-    elif now - job["created"] > JOB_TIMEOUT_S:
+    if now - job["created"] > JOB_TIMEOUT_S:
         _finish_locked("error", "job timed out")
 
 
@@ -168,13 +167,14 @@ async def analyze(job_id: str, images: list[bytes]) -> None:
 async def health():
     async with lock:
         _expire_locked()
-        return {"ok": True, "active_job": None if job is None else
+        return {"ok": True, "camera_connected": camera_ws is not None,
+                "active_job": None if job is None else
                 {"id": job["id"], "status": job["status"]}}
 
 
 @app.post("/button")
 async def button(request: Request, x_device_key: str | None = Header(None)):
-    """Button board: create a job, unless one is already running."""
+    """Button board: create a job and push it to the camera, unless one is already running."""
     global job
     check_key(x_device_key)
     try:
@@ -185,33 +185,54 @@ async def button(request: Request, x_device_key: str | None = Header(None)):
         _expire_locked()
         if job is not None:
             raise HTTPException(409, {"busy": True, "job_id": job["id"]})
+        ws = camera_ws
+        if ws is None:
+            raise HTTPException(503, {"camera": "offline"})
+        new_id = uuid.uuid4().hex[:10]
+        try:
+            await ws.send_json({"cmd": "capture", "job_id": new_id,
+                                "shots": 8, "keep": IMAGES_EXPECTED})
+        except Exception as e:
+            log.warning("could not reach camera: %r", e)
+            raise HTTPException(503, {"camera": "unreachable"})
         job = {
-            "id": uuid.uuid4().hex[:10],
-            "status": "pending",          # pending -> claimed -> analyzing -> done
+            "id": new_id,
+            "status": "claimed",          # claimed -> analyzing -> done
             "created": time.time(),
             "images": {},
             "battery_pct": body.get("battery_pct"),
         }
-        log.info("job %s created (battery %s%%)", job["id"], job["battery_pct"])
-        return {"job_id": job["id"]}
+        log.info("job %s created and sent to camera (battery %s%%)", new_id, job["battery_pct"])
+        return {"job_id": new_id}
 
 
-@app.get("/camera/next")
-async def camera_next(x_device_key: str | None = Header(None)):
-    """Camera board: long-poll for a pending job and claim it."""
-    check_key(x_device_key)
-    deadline = time.monotonic() + LONG_POLL_S
-    while True:
-        async with lock:
-            _expire_locked()
-            if job is not None and job["status"] == "pending":
-                job["status"] = "claimed"
-                job["claimed_at"] = time.time()
-                log.info("job %s claimed by camera", job["id"])
-                return {"job_id": job["id"], "shots": 8, "keep": IMAGES_EXPECTED}
-        if time.monotonic() >= deadline:
-            return Response(status_code=204)
-        await asyncio.sleep(0.1)
+@app.websocket("/camera/ws")
+async def camera_socket(ws: WebSocket):
+    """Camera board keeps this open. Jobs are pushed down it as {"cmd":"capture",...}."""
+    global camera_ws
+    if not DEVICE_KEY or ws.headers.get("x-device-key") != DEVICE_KEY:
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    old, camera_ws = camera_ws, ws   # a reconnecting camera replaces any stale socket
+    if old is not None:
+        try:
+            await old.close()
+        except Exception:
+            pass
+    log.info("camera connected")
+    try:
+        while True:
+            msg = await ws.receive_text()   # camera sends small status messages; just log them
+            log.info("camera says: %s", msg[:200])
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning("camera socket error: %r", e)
+    finally:
+        if camera_ws is ws:
+            camera_ws = None
+            log.info("camera disconnected")
 
 
 @app.post("/camera/{job_id}/image/{rank}")

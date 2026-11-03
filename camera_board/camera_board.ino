@@ -4,10 +4,12 @@
   Board settings (Arduino IDE):
     Board: "XIAO_ESP32S3"
     PSRAM: "OPI PSRAM"   <-- required
-  Libraries: ArduinoJson (v7). esp_camera / img_converters ship with the ESP32 core.
+  Libraries: ArduinoJson (v7), "WebSockets" by Markus Sattler.
+             esp_camera / img_converters ship with the ESP32 core.
 
   Per job:
-    1. Long-poll GET /camera/next and claim a job
+    1. Stay connected to the server over a WebSocket; the server pushes
+       {"cmd":"capture","job_id":...} when the button is pressed
     2. Take 8 photos, save all to /jobs/<id>/img_N.jpg
     3. Score each by text sharpness (variance of the Laplacian on a
        half-resolution decode) and log scores to /jobs/<id>/scores.txt
@@ -23,6 +25,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <ArduinoJson.h>
+#include <WebSocketsClient.h>
 
 // ------------------------------------------------------------ config
 const char* WIFI_SSID  = "your-ssid";
@@ -58,6 +61,8 @@ const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is 
 #define PCLK_GPIO_NUM  13
 
 WiFiClientSecure tls;
+WebSocketsClient ws;
+String pendingJob;   // set by the WebSocket handler, run from loop()
 
 // ------------------------------------------------------------ camera
 bool initCamera() {
@@ -247,6 +252,7 @@ void runJob(const String& id) {
     int i = order[r];
     if (score[i] < 0) break;
     if (uploadFile(id, uploaded, dir + "/img_" + i + ".jpg")) uploaded++;
+    ws.loop();  // keep the server connection alive between uploads
   }
 
   if (uploaded < MIN_UPLOADS) { reportFail(id, "upload failed"); return; }
@@ -254,6 +260,29 @@ void runJob(const String& id) {
   String resp;
   int code = httpJson("POST", "/camera/" + id + "/submit", "", resp);
   Serial.printf("submit -> %d %s\n", code, resp.c_str());
+}
+
+// ------------------------------------------------------------ server connection
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("connected to server, waiting for jobs");
+      ws.sendTXT("{\"event\":\"hello\"}");
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("disconnected from server, reconnecting...");
+      break;
+    case WStype_TEXT: {
+      JsonDocument d;
+      if (deserializeJson(d, payload, length)) break;
+      const char* cmd = d["cmd"] | "";
+      const char* id  = d["job_id"] | "";
+      if (strcmp(cmd, "capture") == 0 && id[0]) pendingJob = id;  // run it from loop()
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 // ------------------------------------------------------------ setup / loop
@@ -265,26 +294,28 @@ void setup() {
 
   tls.setInsecure();  // proof of concept: skips certificate check (see README)
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);   // modem sleep: much cooler, long-poll still works
+  WiFi.setSleep(true);   // modem sleep: much cooler, WebSocket still works
   ensureWifi(15000);
+
+  String host = String(SERVER);
+  host.replace("https://", "");
+  host.replace("/", "");
+  ws.beginSSL(host.c_str(), 443, "/camera/ws");
+  ws.setExtraHeaders((String("X-Device-Key: ") + DEVICE_KEY).c_str());
+  ws.onEvent(onWsEvent);
+  ws.setReconnectInterval(3000);
+  ws.enableHeartbeat(15000, 5000, 2);   // ping every 15 s; drop + reconnect if 2 pongs missed
   Serial.println("camera board ready");
 }
 
 void loop() {
-  if (!ensureWifi()) { delay(1000); return; }
-  String resp;
-  // Server holds this request open up to ~25 s waiting for a job
-  int code = httpJson("GET", "/camera/next", "", resp, 30000);
-  if (code == 200) {
-    JsonDocument d;
-    if (!deserializeJson(d, resp)) {
-      String id = d["job_id"] | "";
-      if (id.length()) runJob(id);
-    }
-  } else if (code == 204) {
-    Serial.println("no job yet, waiting again");
-  } else {
-    Serial.printf("poll -> %d\n", code);
-    delay(1000);
+  ensureWifi();
+  ws.loop();
+  if (pendingJob.length()) {
+    String id = pendingJob;
+    pendingJob = "";
+    runJob(id);
+    String done = "{\"event\":\"job_finished\",\"job_id\":\"" + id + "\"}";
+    ws.sendTXT(done);
   }
 }

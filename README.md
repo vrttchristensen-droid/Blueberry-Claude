@@ -6,7 +6,7 @@ ranking), and a **Render server** (job lock, vision, voting).
 ```
 button press ──POST /button──▶ server creates job (rejects new presses while one exists)
                                    │
-camera board ──GET /camera/next (long-poll)──▶ claims job
+server ──pushes "capture" over the camera's open WebSocket──▶ camera board
    takes 8 photos → SD card → ranks by sharpness → uploads best 4 → POST /submit
                                    │
 server: 4 parallel vision reads → each returns a letter or UNCLEAR
@@ -25,15 +25,16 @@ button board ──GET /job/{id} (polling)──▶ gets result → vibrates →
 4. The free plan sleeps when idle, which adds a long delay to the first press. Use a paid plan
    for 24/7.
 
-Optional env vars: `CLAUDE_MODEL`, `JOB_TIMEOUT_S` (90), `CLAIM_TIMEOUT_S` (15),
-`RESULT_HOLD_S` (120), `LONG_POLL_S` (25).
+Optional env vars: `CLAUDE_MODEL`, `JOB_TIMEOUT_S` (90), `RESULT_HOLD_S` (120).
+
+Opening the service URL shows `camera_connected: true` when the camera board's WebSocket is up.
 
 ### Button board
 Wiring and libraries are at the top of `button_board/button_board.ino`. Set Wi-Fi, `SERVER`,
 `DEVICE_KEY`, and `MOTOR_IS_LRA` to match your motor.
 
 ### Camera board
-Set PSRAM to **OPI PSRAM**, format the card **FAT32** (32 GB is fine), fill in the same config.
+Install the **WebSockets** library by Markus Sattler. Set PSRAM to **OPI PSRAM**, format the card **FAT32** (32 GB is fine), fill in the same config.
 After the first job, pull the SD card and check `/jobs/<id>/`:
 - images upright and not mirrored? If not, change `set_vflip` / `set_hmirror`.
   This matters, because "topmost question" is judged from the image.
@@ -53,7 +54,7 @@ After the first job, pull the SD card and check `/jobs/<id>/`:
 Answers are reported **by position**: "C" means the third option, whatever its printed label.
 
 ## Failure handling
-- Camera never claims the job → error after 15 s, button unlocked.
+- Camera board not connected when the button is pressed → immediate error pattern.
 - Any job stuck → error after 90 s, button unlocked.
 - Result never collected (button board died) → auto-closed after 120 s.
 - Fewer than 3 usable images → retake.
