@@ -70,13 +70,15 @@ void repeatEffect(uint8_t e, int n, int gapMs) {
   }
 }
 
-void hapticAck()     { effect(24); }                 // Sharp Tick 1
-void hapticRetake()  { repeatEffect(15, 2, 300); }   // 750 ms Alert
-void hapticBusy()    { effect(16); }                 // 1000 ms Alert
-void hapticError()   { repeatEffect(47, 4, 120); }   // Buzz 1
-void hapticLowBatt() { repeatEffect(52, 3, 200); }   // Pulsing Strong 1
+// Every pattern is also printed, so the board works with nothing wired to it
+void hapticAck()     { Serial.println("[haptic] tick (accepted/ready)");      effect(24); }
+void hapticRetake()  { Serial.println("[haptic] RETAKE (2 long buzzes)");     repeatEffect(15, 2, 300); }
+void hapticBusy()    { Serial.println("[haptic] BUSY (1 very long buzz)");    effect(16); }
+void hapticError()   { Serial.println("[haptic] ERROR (4 rapid buzzes)");     repeatEffect(47, 4, 120); }
+void hapticLowBatt() { Serial.println("[haptic] LOW BATTERY (3 pulses)");     repeatEffect(52, 3, 200); }
 
 void hapticAnswer(int index) {                       // 1-based
+  Serial.printf("[haptic] ANSWER %c (%d clicks)\n", 'A' + index - 1, index);
   delay(800);  // gap so the ack tick isn't counted as a click
   for (int r = 0; r < ANSWER_REPEATS; r++) {
     repeatEffect(1, index, 350);                     // Strong Click 100%
@@ -182,6 +184,7 @@ void setup() {
 
   if (haveGauge && gauge.cellPercent() < LOW_BATT_PCT) hapticLowBatt();
   else hapticAck();  // "ready"
+  Serial.println("Ready. Press the button, or type B + Enter here to simulate a press.");
 }
 
 void loop() {
@@ -192,6 +195,16 @@ void loop() {
     lastChange = millis();
     last = s;
     if (s == LOW) handlePress();  // blocks until result: presses meanwhile are ignored
+  }
+
+  // Simulated press: type B (or b) in the Serial Monitor and hit Enter
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'B' || c == 'b') {
+      Serial.println("--- simulated button press ---");
+      handlePress();
+      while (Serial.available()) Serial.read();  // ignore anything typed while busy
+    }
   }
   delay(5);
 }
