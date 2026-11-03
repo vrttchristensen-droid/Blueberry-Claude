@@ -144,6 +144,7 @@ int httpJson(const char* method, const String& path, const String& body, String&
              uint32_t timeoutMs = 10000) {
   HTTPClient http;
   http.setTimeout(timeoutMs);
+  http.setReuse(false);  // ask the server to close the connection after each reply
   if (!http.begin(tls, String(SERVER) + path)) return -1;
   http.addHeader("X-Device-Key", DEVICE_KEY);
   int code;
@@ -153,7 +154,8 @@ int httpJson(const char* method, const String& path, const String& body, String&
   } else {
     code = http.sendRequest(method);
   }
-  out = code > 0 ? http.getString() : "";
+  // 204 has no body: reading one would hang until the timeout
+  out = (code > 0 && code != 204) ? http.getString() : "";
   http.end();
   return code;
 }
@@ -279,7 +281,9 @@ void loop() {
       String id = d["job_id"] | "";
       if (id.length()) runJob(id);
     }
-  } else if (code != 204) {
+  } else if (code == 204) {
+    Serial.println("no job yet, waiting again");
+  } else {
     Serial.printf("poll -> %d\n", code);
     delay(1000);
   }
