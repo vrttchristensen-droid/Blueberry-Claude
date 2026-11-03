@@ -1,123 +1,67 @@
-# Blueberry: haptic camera
+# Multiple-choice reader: proof of concept
 
-> **New here? Follow [SETUP_GUIDE.md](SETUP_GUIDE.md).** It walks through everything, mostly from a phone.
->
-> [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/vrttchristensen-droid/Blueberry-Claude)
->
-> Once the server is up, install the board code from `<your server>/flash/` in Chrome, then set each board up from your phone (it opens a `Blueberry-...-Setup` Wi-Fi network).
-
-You press a button on a wearable. A second board with a camera takes a burst of photos. A server asks Claude what's in them. The answer comes back to your wrist as a vibration pattern.
+Three parts: a **button board** (input + haptic output), a **camera board** (capture + sharpness
+ranking), and a **Render server** (job lock, vision, voting).
 
 ```
- ┌──────────────────────┐   1. POST /api/jobs        ┌───────────────────┐
- │ Button node          │ ─────────────────────────▶ │                   │
- │ XIAO ESP32-S3        │                            │  Render server    │
- │ DRV2605L + 1034 motor│ ◀───────────────────────── │  (FastAPI +       │
- │ MAX17048 + button    │   5. long-poll result      │   Claude vision)  │
- └──────────────────────┘                            │                   │
-                                                     │  4. classify each │
- ┌──────────────────────┐   2. long-poll /claim      │     photo, vote   │
- │ Camera node          │ ◀───────────────────────── │                   │
- │ XIAO ESP32-S3 Sense  │   3. upload 4 sharpest     │                   │
- │ OV3660 + 32 GB SD    │ ─────────────────────────▶ │                   │
- └──────────────────────┘                            └───────────────────┘
+button press ──POST /button──▶ server creates job (rejects new presses while one exists)
+                                   │
+camera board ──GET /camera/next (long-poll)──▶ claims job
+   takes 8 photos → SD card → ranks by sharpness → uploads best 4 → POST /submit
+                                   │
+server: 4 parallel vision reads → each returns a letter or UNCLEAR
+        ≥3 agree → answer   |   otherwise → retake
+                                   │
+button board ──GET /job/{id} (polling)──▶ gets result → vibrates → job closed
 ```
-
-1. **Button pressed.** The button node clicks once to confirm, then creates a job on the server.
-2. **Camera claims it.** The camera node is always long-polling `/api/jobs/claim`, so it picks the job up within a fraction of a second.
-3. **Burst + pick sharpest.** It takes 8 photos and scores each one for sharpness (variance of the Laplacian on a ¼-scale grayscale decode). All 8 are archived to the SD card, and the 4 sharpest are uploaded.
-4. **AI analysis + vote.** The server sends each of the 4 photos to Claude separately. Each call must answer with one label from `server/analysis_config.json`, or `unclear`. The label with the most votes wins, as long as it has at least `min_agreement` votes (default 2) and isn't tied.
-5. **Vibrate.** The button node long-polls the job and plays the result.
-
-## Haptic codes
-
-| Pattern | Meaning |
-|---|---|
-| 1 sharp click | Button press registered (also played once at boot) |
-| **N long buzzes** | Answer #N. With the default config: 1 = person, 2 = vehicle, 3 = animal, 4 = food, 5 = other |
-| **2 × three fast buzzes** (bzz-bzz-bzz … bzz-bzz-bzz) | **Retake.** The photos didn't agree, or were too blurry or dark |
-| **One 1.5 s continuous buzz** | **Error.** Wi-Fi, server, camera or timeout problem |
-| 2 soft double-clicks | Battery below 15 % |
-| Hold button 1.5 s → 1–4 pulses | Battery level in quarters |
-
-To change what the AI looks for, edit `server/analysis_config.json`. Change the `question`, the `labels` (their order sets the buzz count), and `min_agreement`, then restart the server. Five labels or fewer keeps the buzz counts easy to tell apart.
-
-## Wiring: button node
-
-All I2C parts share one bus. The DRV2605L is at 0x5A and the MAX17048 is at 0x36.
-
-| XIAO ESP32-S3 pin | Connects to |
-|---|---|
-| D4 / GPIO5 (SDA) | DRV2605L SDA, MAX17048 SDA |
-| D5 / GPIO6 (SCL) | DRV2605L SCL, MAX17048 SCL |
-| 3V3 | DRV2605L VIN, MAX17048 VIN |
-| GND | DRV2605L GND, MAX17048 GND, one side of the button |
-| D1 / GPIO2 | Other side of the button (internal pull-up; pressed = LOW) |
-| BAT+ / BAT− pads | LiPo cell. Also connect the MAX17048 breakout's battery input across the same cell so it can measure it |
-
-1034 motor: red lead to DRV2605L **OUT+**, blue lead to **OUT−**. The 1034 is an ERM coin motor, and the firmware configures the driver for ERM.
-
-> The firmware targets the **MAX17048** (Adafruit's "MAX1704x" breakout and library). If you have a MAX17043/44, the readings use a different register scale, so swap in the SparkFun MAX1704x library.
-
-The button node goes into deep sleep after 5 minutes idle (`IDLE_SLEEP_MS`). Pressing the button wakes it and starts a job straight away. Expect a 2–3 s Wi-Fi reconnect delay before the click when it's waking up.
-
-## Camera node
-
-Nothing to wire. The OV3660 and the microSD slot are on the Sense expansion board. Format the 32 GB card as **FAT32**. Shots are saved to `/jobs/<job_id>/shot<N>_<sharpness>.jpg`.
-
-The SD card's chip-select is GPIO21, which is also the XIAO's orange user LED, so the firmware leaves the LED alone.
 
 ## Setup
 
-### 1. Render server
+### Server (Render)
+1. Put the `server/` folder in a GitHub repo, create a Render Blueprint from `render.yaml`
+   (or a Web Service with the same build/start commands).
+2. Set `DEVICE_KEY` (long random string) and `ANTHROPIC_API_KEY`.
+3. Keep **one worker** and **one instance**: job state is in memory.
+4. The free plan sleeps when idle, which adds a long delay to the first press. Use a paid plan
+   for 24/7.
 
-Use a PC, a Raspberry Pi 4/5, or any machine on the same network as the boards.
+Optional env vars: `CLAUDE_MODEL`, `JOB_TIMEOUT_S` (90), `CLAIM_TIMEOUT_S` (15),
+`RESULT_HOLD_S` (120), `LONG_POLL_S` (25).
 
-```bash
-cd server
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...        # your Claude API key
-export DEVICE_API_KEY=some-long-random-string
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
+### Button board
+Wiring and libraries are at the top of `button_board/button_board.ino`. Set Wi-Fi, `SERVER`,
+`DEVICE_KEY`, and `MOTOR_IS_LRA` to match your motor.
 
-To test the whole chain before you spend API credits, run with `ANALYZER=mock`. It returns fake labels; set `MOCK_ANSWER=animal` to force one specific label.
+### Camera board
+Set PSRAM to **OPI PSRAM**, format the card **FAT32** (32 GB is fine), fill in the same config.
+After the first job, pull the SD card and check `/jobs/<id>/`:
+- images upright and not mirrored? If not, change `set_vflip` / `set_hmirror`.
+  This matters, because "topmost question" is judged from the image.
+- `scores.txt` shows the sharpness ranking; the top 4 should be the readable ones.
 
-The Claude requests use `claude-opus-5-5` at `low` effort, with structured output that restricts each answer to your label list. They also send `fallbacks: "default"`, so if a safety classifier declines a photo, the API re-runs it on a fallback model instead of failing. A photo that still gets no usable answer counts as `unclear`. You can change the model and effort in `analysis_config.json`.
+## Haptic patterns
 
-Other environment variables: `NUM_CAPTURES` (8), `NUM_UPLOAD` (4), `QUEUE_TIMEOUT_S` (45 s with no camera → error), `CAPTURE_TIMEOUT_S` (60 s for the camera to finish → error), `DATA_DIR` (uploaded photos and votes, kept per job).
+| Meaning | Pattern |
+|---|---|
+| Press accepted / ready | 1 sharp tick |
+| Answer | N strong clicks (A=1, B=2, C=3, D=4, E=5), played twice |
+| Retake (2/4 or worse, unclear, capture failed) | 2 long buzzes |
+| Busy (job already running) | 1 very long buzz |
+| Error (no Wi-Fi, server down, timeout) | 4 rapid buzzes |
+| Low battery (<15%) | 3 pulses |
 
-### 2. Firmware (PlatformIO)
+Answers are reported **by position**: "C" means the third option, whatever its printed label.
 
-For each board:
+## Failure handling
+- Camera never claims the job → error after 15 s, button unlocked.
+- Any job stuck → error after 90 s, button unlocked.
+- Result never collected (button board died) → auto-closed after 120 s.
+- Fewer than 3 usable images → retake.
 
-```bash
-cd firmware/button_node            # or firmware/camera_node
-cp include/config.example.h include/config.h
-# edit config.h: Wi-Fi, SERVER_URL (http://<server-ip>:8000), API_KEY = DEVICE_API_KEY
-pio run -t upload && pio device monitor
-```
-
-The camera node needs OPI PSRAM, which `platformio.ini` already enables. If you use the Arduino IDE instead, pick the board **XIAO_ESP32S3** and set *Tools → PSRAM → OPI PSRAM*. The button node's libraries are *Adafruit DRV2605*, *Adafruit MAX1704X* and *ArduinoJson*.
-
-## API reference
-
-Every request needs the `X-API-Key` header.
-
-| Method | Path | Who | Purpose |
-|---|---|---|---|
-| POST | `/api/jobs` `{device_id, battery_pct, battery_v}` | button | Create a job |
-| GET | `/api/jobs/claim?wait=20&camera_id=` | camera | Long-poll; `200 {job_id, num_captures, num_upload}` or `204` |
-| POST | `/api/jobs/{id}/images?rank=&shot=&sharpness=` | camera | Raw JPEG body; rank 0 = sharpest |
-| POST | `/api/jobs/{id}/finalize` | camera | Start the analysis |
-| POST | `/api/jobs/{id}/fail` `{reason}` | camera | Report a capture/upload failure |
-| GET | `/api/jobs/{id}?wait=20` | button | Long-poll; `{status, answer, code, votes, detail}` |
-
-`status` is one of `queued → capturing → analyzing → done | retake | error`. `code` is the 1-based label index (0 unless `done`).
-
-## Notes and limits
-
-- The boards work with `http://` (server on your own network) and `https://` (e.g. Render.com). For HTTPS they encrypt traffic but skip certificate checking (`setInsecure()`). To harden that, load your host's CA certificate into `secureClient`.
-- Job state is held in memory, so restarting the server drops in-flight jobs. The button then times out and buzzes ERROR.
-- With one camera, jobs run one at a time in press order. Extra cameras just need unique `CAMERA_ID`s.
+## Things to tighten past proof of concept
+- **TLS:** both boards use `setInsecure()`. Pin Render's root CA with `tls.setCACert(...)`.
+- **Battery:** the button board keeps Wi-Fi up. Light sleep with button wake would extend runtime
+  a lot, at the cost of ~1–2 s reconnect per press.
+- **Sharpness:** whole-frame Laplacian variance. If background clutter wins over the page,
+  score only a center crop.
+- **SD space:** each job is ~8 × 200–400 KB. Nothing is deleted automatically.

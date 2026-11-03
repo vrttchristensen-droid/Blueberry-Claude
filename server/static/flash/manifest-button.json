@@ -1,8 +1,0 @@
-{
-  "name": "Blueberry button board",
-  "version": "1.0",
-  "new_install_prompt_erase": true,
-  "builds": [
-    { "chipFamily": "ESP32-S3", "parts": [{ "path": "button.bin", "offset": 0 }] }
-  ]
-}

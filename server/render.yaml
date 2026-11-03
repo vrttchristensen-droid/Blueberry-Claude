@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: mcq-server
+    runtime: python
+    plan: starter            # free plan sleeps when idle; a paid plan stays up 24/7
+    buildCommand: pip install -r requirements.txt
+    # ONE worker only: job state lives in memory
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /
+    envVars:
+      - key: DEVICE_KEY
+        sync: false          # set a long random string; same value in both firmwares
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-5-5
