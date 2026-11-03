@@ -1,0 +1,15 @@
+# Render Blueprint: lets "Deploy to Render" set the server up in one step.
+services:
+  - type: web
+    name: haptic-camera
+    runtime: python
+    plan: free
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DEVICE_API_KEY
+        sync: false          # Render asks you to type this in when you deploy
+      - key: ANALYZER
+        value: mock          # fake answers until you add ANTHROPIC_API_KEY and delete this

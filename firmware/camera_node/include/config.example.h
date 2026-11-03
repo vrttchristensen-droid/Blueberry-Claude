@@ -2,6 +2,8 @@
 // config.h is git-ignored so your Wi-Fi password never gets committed.
 #pragma once
 
+// OPTIONAL: you can leave the Wi-Fi, server and password values as they are and set
+// the board up from your phone instead (it opens a "Blueberry-...-Setup" Wi-Fi network).
 #define WIFI_SSID      "your-wifi"
 #define WIFI_PASSWORD  "your-password"
 

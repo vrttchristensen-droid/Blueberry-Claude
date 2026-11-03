@@ -17,6 +17,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SD.h>
@@ -25,6 +27,8 @@
 #include "img_converters.h"
 
 // ============================ YOUR SETTINGS ============================
+// OPTIONAL: you can leave the Wi-Fi, server and password values as they are and set
+// the board up from your phone instead (it opens a "Blueberry-...-Setup" Wi-Fi network).
 #define WIFI_SSID      "your-wifi"
 #define WIFI_PASSWORD  "your-password"
 
@@ -61,6 +65,7 @@
 #define PCLK_GPIO_NUM  13
 
 static const int SD_CS_PIN = 21;
+static const int PIN_BOOT_BUTTON = 0;  // the tiny "B" button on the XIAO
 
 static const int MAX_CAPTURES = 16;
 static const int MAX_KEEP = 8;
@@ -152,6 +157,64 @@ float measureSharpness(const camera_fb_t *fb) {
   return (float)(sumSq / n - mean * mean);
 }
 
+static const char *SETUP_AP_NAME = "Blueberry-Camera-Setup";
+
+// ------------------------------------------------------------------ settings + phone setup
+
+// Settings are stored on the board. They come from the phone setup page (WiFiManager),
+// or, if you filled in YOUR SETTINGS above, from there.
+Preferences prefs;
+String serverUrl;
+String apiKey;
+
+void loadSettings() {
+  prefs.begin("blueberry", true);
+  serverUrl = prefs.getString("server", SERVER_URL);
+  apiKey = prefs.getString("apikey", API_KEY);
+  prefs.end();
+}
+
+bool settingsLookValid() {
+  return serverUrl.startsWith("http") && serverUrl.indexOf("your-app-name") < 0 &&
+         apiKey.length() > 0 && apiKey != "change-me";
+}
+
+bool wifiConfiguredInCode() { return strcmp(WIFI_SSID, "your-wifi") != 0; }
+
+// Opens the setup Wi-Fi network. Join it on your phone and a setup page pops up
+// (or browse to 192.168.4.1). Pick your Wi-Fi, enter its password, the server address
+// and the device password, then tap Save. Gives up after 5 minutes.
+bool runSetupPortal() {
+  Serial.printf("setup mode: join Wi-Fi \"%s\" on your phone\n", SETUP_AP_NAME);
+  WiFiManager wm;
+  WiFiManagerParameter pServer("server", "Server address (e.g. https://haptic-camera.onrender.com)",
+                               settingsLookValid() ? serverUrl.c_str() : "", 120);
+  WiFiManagerParameter pKey("apikey", "Device password (same as DEVICE_API_KEY on Render)",
+                            settingsLookValid() ? apiKey.c_str() : "", 80);
+  wm.addParameter(&pServer);
+  wm.addParameter(&pKey);
+  wm.setTitle("Blueberry setup");
+  wm.setConfigPortalTimeout(300);
+  wm.setConnectTimeout(20);
+  bool ok = wm.startConfigPortal(SETUP_AP_NAME);
+
+  String s = pServer.getValue();
+  s.trim();
+  while (s.endsWith("/")) s.remove(s.length() - 1);
+  String k = pKey.getValue();
+  k.trim();
+  if (s.length() && k.length()) {
+    prefs.begin("blueberry", false);
+    prefs.putString("server", s);
+    prefs.putString("apikey", k);
+    prefs.end();
+    serverUrl = s;
+    apiKey = k;
+    Serial.printf("saved server %s\n", serverUrl.c_str());
+  }
+  return ok && WiFi.status() == WL_CONNECTED;
+}
+
 // ------------------------------------------------------------------ http(s)
 
 // Works with both http:// (local server) and https:// (e.g. Render.com) addresses.
@@ -174,7 +237,8 @@ bool ensureWifi(uint32_t timeoutMs = 15000) {
   if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // lower latency for the long-poll
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (wifiConfiguredInCode()) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  else WiFi.begin();  // network saved by the phone setup page
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
@@ -188,8 +252,8 @@ bool ensureWifi(uint32_t timeoutMs = 15000) {
 int postJson(const String &path, const String &body, String *out = nullptr) {
   HTTPClient http;
   http.setTimeout(10000);
-  if (!beginHttp(http, String(SERVER_URL) + path)) return -1;
-  http.addHeader("X-API-Key", API_KEY);
+  if (!beginHttp(http, serverUrl + path)) return -1;
+  http.addHeader("X-API-Key", apiKey);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   if (out && code > 0) *out = http.getString();
@@ -210,8 +274,8 @@ void reportFailure(const String &jobId, const String &reason) {
 bool claimJob(String &jobId, int &numCaptures, int &numUpload) {
   HTTPClient http;
   http.setTimeout(30000);
-  if (!beginHttp(http, String(SERVER_URL) + "/api/jobs/claim?wait=20&camera_id=" + CAMERA_ID)) return false;
-  http.addHeader("X-API-Key", API_KEY);
+  if (!beginHttp(http, serverUrl + "/api/jobs/claim?wait=20&camera_id=" + CAMERA_ID)) return false;
+  http.addHeader("X-API-Key", apiKey);
   int code = http.GET();
   bool ok = false;
   if (code == 200) {
@@ -234,10 +298,10 @@ bool uploadShot(const String &jobId, int rank, const Shot &s) {
   for (int attempt = 0; attempt < 2; attempt++) {
     HTTPClient http;
     http.setTimeout(20000);
-    String url = String(SERVER_URL) + "/api/jobs/" + jobId + "/images?rank=" + rank +
+    String url = serverUrl + "/api/jobs/" + jobId + "/images?rank=" + rank +
                  "&shot=" + s.index + "&sharpness=" + String(s.sharpness, 1);
     if (!beginHttp(http, url)) continue;
-    http.addHeader("X-API-Key", API_KEY);
+    http.addHeader("X-API-Key", apiKey);
     http.addHeader("Content-Type", "image/jpeg");
     int code = http.POST(s.buf, s.len);
     http.end();
@@ -376,7 +440,23 @@ void setup() {
     Serial.println("SD card not found - continuing without archive");
   }
 
-  ensureWifi();
+  // Press and hold the BOOT (B) button during the first 3 seconds after power-on to
+  // re-open phone setup. It also opens by itself if there are no settings or Wi-Fi fails.
+  loadSettings();
+  pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
+  bool forceSetup = false;
+  Serial.println("hold BOOT now to enter phone setup...");
+  for (uint32_t t = millis(); millis() - t < 3000 && !forceSetup;) {
+    if (digitalRead(PIN_BOOT_BUTTON) == LOW) forceSetup = true;
+    delay(20);
+  }
+  if (forceSetup || !settingsLookValid() || !ensureWifi()) {
+    if (!runSetupPortal()) {
+      Serial.println("setup not finished - restarting");
+      delay(1000);
+      ESP.restart();
+    }
+  }
 }
 
 void loop() {

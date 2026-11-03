@@ -26,6 +26,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Adafruit_DRV2605.h>
 #include <Adafruit_MAX1704X.h>
@@ -33,6 +35,8 @@
 #include <esp_sleep.h>
 
 // ============================ YOUR SETTINGS ============================
+// OPTIONAL: you can leave the Wi-Fi, server and password values as they are and set
+// the board up from your phone instead (it opens a "Blueberry-...-Setup" Wi-Fi network).
 #define WIFI_SSID      "your-wifi"
 #define WIFI_PASSWORD  "your-password"
 
@@ -108,6 +112,11 @@ void patternError() {
   buzz(1500);
 }
 
+// Three slow pulses: the board is now in phone setup mode.
+void patternSetup() {
+  for (int i = 0; i < 3; i++) { buzz(300, 0x50); delay(400); }
+}
+
 void patternLowBattery() {
   for (int i = 0; i < 2; i++) { effect(10); delay(300); }  // 10 = Double Click 100%
 }
@@ -127,6 +136,64 @@ void patternBatteryLevel() {
   Serial.printf("battery %.1f%% %.3fV -> %d pulses\n", p, gauge.cellVoltage(), pulses);
   delay(300);
   for (int i = 0; i < pulses; i++) { buzz(200, 0x60); delay(250); }
+}
+
+static const char *SETUP_AP_NAME = "Blueberry-Button-Setup";
+
+// ------------------------------------------------------------------ settings + phone setup
+
+// Settings are stored on the board. They come from the phone setup page (WiFiManager),
+// or, if you filled in YOUR SETTINGS above, from there.
+Preferences prefs;
+String serverUrl;
+String apiKey;
+
+void loadSettings() {
+  prefs.begin("blueberry", true);
+  serverUrl = prefs.getString("server", SERVER_URL);
+  apiKey = prefs.getString("apikey", API_KEY);
+  prefs.end();
+}
+
+bool settingsLookValid() {
+  return serverUrl.startsWith("http") && serverUrl.indexOf("your-app-name") < 0 &&
+         apiKey.length() > 0 && apiKey != "change-me";
+}
+
+bool wifiConfiguredInCode() { return strcmp(WIFI_SSID, "your-wifi") != 0; }
+
+// Opens the setup Wi-Fi network. Join it on your phone and a setup page pops up
+// (or browse to 192.168.4.1). Pick your Wi-Fi, enter its password, the server address
+// and the device password, then tap Save. Gives up after 5 minutes.
+bool runSetupPortal() {
+  Serial.printf("setup mode: join Wi-Fi \"%s\" on your phone\n", SETUP_AP_NAME);
+  WiFiManager wm;
+  WiFiManagerParameter pServer("server", "Server address (e.g. https://haptic-camera.onrender.com)",
+                               settingsLookValid() ? serverUrl.c_str() : "", 120);
+  WiFiManagerParameter pKey("apikey", "Device password (same as DEVICE_API_KEY on Render)",
+                            settingsLookValid() ? apiKey.c_str() : "", 80);
+  wm.addParameter(&pServer);
+  wm.addParameter(&pKey);
+  wm.setTitle("Blueberry setup");
+  wm.setConfigPortalTimeout(300);
+  wm.setConnectTimeout(20);
+  bool ok = wm.startConfigPortal(SETUP_AP_NAME);
+
+  String s = pServer.getValue();
+  s.trim();
+  while (s.endsWith("/")) s.remove(s.length() - 1);
+  String k = pKey.getValue();
+  k.trim();
+  if (s.length() && k.length()) {
+    prefs.begin("blueberry", false);
+    prefs.putString("server", s);
+    prefs.putString("apikey", k);
+    prefs.end();
+    serverUrl = s;
+    apiKey = k;
+    Serial.printf("saved server %s\n", serverUrl.c_str());
+  }
+  return ok && WiFi.status() == WL_CONNECTED;
 }
 
 // ------------------------------------------------------------------ http(s)
@@ -150,7 +217,8 @@ bool beginHttp(HTTPClient &http, const String &url) {
 bool ensureWifi(uint32_t timeoutMs = 15000) {
   if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (wifiConfiguredInCode()) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  else WiFi.begin();  // network saved by the phone setup page
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
@@ -166,8 +234,8 @@ int httpRequest(const char *method, const String &path, const String &body, Stri
   HTTPClient http;
   http.setTimeout(timeoutMs);
   http.setConnectTimeout(5000);
-  if (!beginHttp(http, String(SERVER_URL) + path)) return -1;
-  http.addHeader("X-API-Key", API_KEY);
+  if (!beginHttp(http, serverUrl + path)) return -1;
+  http.addHeader("X-API-Key", apiKey);
   int code;
   if (strcmp(method, "POST") == 0) {
     http.addHeader("Content-Type", "application/json");
@@ -272,13 +340,21 @@ void setup() {
   gaugeOk = gauge.begin();
   if (!gaugeOk) Serial.println("MAX17048 not found - check wiring / battery");
 
+  loadSettings();
   if (wokeByButton) {
     runJob();
   } else {
-    patternAck();  // boot ok
-    ensureWifi();
+    // Holding the button while switching on (or having no settings yet) opens phone setup.
+    bool forceSetup = digitalRead(PIN_BUTTON) == LOW;
+    if (forceSetup || !settingsLookValid() || !ensureWifi()) {
+      patternSetup();
+      if (runSetupPortal()) patternAck(); else patternError();
+    } else {
+      patternAck();  // boot ok
+    }
   }
 
+  while (digitalRead(PIN_BUTTON) == LOW) delay(10);  // wait for release
   float p = batteryPct();
   if (p >= 0 && p < LOW_BATTERY_PCT) patternLowBattery();
   lastActivity = millis();

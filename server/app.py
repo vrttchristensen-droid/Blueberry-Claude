@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 log = logging.getLogger("render-server")
@@ -299,7 +300,12 @@ class NewJob(BaseModel):
 @app.get("/")
 async def home():
     return {"ok": True, "message": "Haptic camera server is running", "analyzer": ANALYZER,
-            "labels": [l["label"] for l in CONFIG["labels"]]}
+            "labels": [l["label"] for l in CONFIG["labels"]],
+            "board_installer": "/flash/"}
+
+
+# Browser-based firmware installer for both boards (ESP Web Tools): open /flash/ in Chrome.
+app.mount("/flash", StaticFiles(directory=BASE_DIR / "static" / "flash", html=True), name="flash")
 
 
 @app.get("/api/health")

@@ -1,6 +1,10 @@
 # Blueberry: haptic camera
 
-> **New here? Follow [SETUP_GUIDE.md](SETUP_GUIDE.md).** It covers everything step by step, including hosting the server on Render.com.
+> **New here? Follow [SETUP_GUIDE.md](SETUP_GUIDE.md).** It walks through everything, mostly from a phone.
+>
+> [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/vrttchristensen-droid/Blueberry-Claude)
+>
+> Once the server is up, install the board code from `<your server>/flash/` in Chrome, then set each board up from your phone (it opens a `Blueberry-...-Setup` Wi-Fi network).
 
 You press a button on a wearable. A second board with a camera takes a burst of photos. A server asks Claude what's in them. The answer comes back to your wrist as a vibration pattern.
 
