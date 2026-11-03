@@ -18,7 +18,7 @@ button board ──GET /job/{id} (polling)──▶ gets result → vibrates →
 ## Setup
 
 ### Server (Render)
-1. Put the `server/` folder in a GitHub repo, create a Render Blueprint from `render.yaml`
+1. Create a Render Blueprint from this repo (`render.yaml` at the root points at `server/`)
    (or a Web Service with the same build/start commands).
 2. Set `DEVICE_KEY` (long random string) and `ANTHROPIC_API_KEY`.
 3. Keep **one worker** and **one instance**: job state is in memory.
