@@ -196,8 +196,22 @@ const char* chargeState(float pct, float rate) {
   return "idle (settling)";
 }
 
+// Without a fuel gauge, the XIAO can only tell whether a USB host is connected.
+// (It can't see the charger chip, so "on USB" means charging OR already full.)
+bool usbPlugged() {
+#if ARDUINO_USB_MODE
+  return Serial.isPlugged();   // USB-Serial-JTAG: true when a USB host is attached
+#else
+  return (bool)Serial;         // TinyUSB CDC: true when the Serial Monitor is open
+#endif
+}
+
+void printUsbPower() {
+  Serial.printf("power: %s\n", usbPlugged() ? "on USB (charging or full)" : "on battery");
+}
+
 void printBattery() {
-  if (!haveGauge) { Serial.println("battery: fuel gauge not found"); return; }
+  if (!haveGauge) { printUsbPower(); return; }
   float pct = gauge.cellPercent(), v = gauge.cellVoltage(), rate = gauge.chargeRate();
   Serial.printf("battery: %.1f%%, %.2f V, %+.1f %%/hr -> %s\n", pct, v, rate, chargeState(pct, rate));
 }
@@ -206,8 +220,15 @@ void printBattery() {
 void checkBattery() {
   static uint32_t lastCheck = 0, lastPrint = 0;
   static String lastState = "";
-  if (!haveGauge || (lastCheck && millis() - lastCheck < 5000)) return;
+  if (lastCheck && millis() - lastCheck < (haveGauge ? 5000 : 1000)) return;
   lastCheck = millis();
+
+  if (!haveGauge) {                       // no gauge: report USB plug / unplug
+    static int lastUsb = -1;
+    int usb = usbPlugged();
+    if (usb != lastUsb) { lastUsb = usb; printUsbPower(); }
+    return;
+  }
   String st = chargeState(gauge.cellPercent(), gauge.chargeRate());
   if (st != lastState || millis() - lastPrint >= BATT_PRINT_MS) {
     lastState = st;
@@ -246,7 +267,7 @@ void setup() {
   if (haveGauge && gauge.cellPercent() < LOW_BATT_PCT) hapticLowBatt();
   else hapticAck();  // "ready"
   Serial.println("Ready. Press the button, or type B + Enter here to simulate a press.");
-  Serial.println("Type S for battery / charging status.");
+  Serial.println("Type S for battery / power status.");
 }
 
 void loop() {
