@@ -6,7 +6,7 @@
     XIAO D5 (GPIO6) -> SCL   (DRV2605L, MAX17048)
     XIAO 3V3        -> VIN/VCC of both
     XIAO GND        -> GND of both
-    Button          -> between D1 and GND (internal pull-up used)
+    Button          -> between D1 and D0 (D0 is driven LOW as the button's ground)
     Motor           -> DRV2605L OUT+/OUT-
 
   Libraries: Adafruit DRV2605, Adafruit MAX1704X, ArduinoJson (v7)
@@ -40,12 +40,15 @@ const char* SERVER      = "https://your-service.onrender.com";  // no trailing s
 const char* DEVICE_KEY  = "change-me";                          // must match server
 
 #define BUTTON_PIN D1
+#define BUTTON_GND_PIN D0         // other side of the button; held LOW so it acts as ground
 #define MOTOR_IS_LRA false        // true for an LRA (linear) motor, false for ERM (coin/eccentric)
 
 const uint32_t RESULT_TIMEOUT_MS = 100000;  // a bit longer than server JOB_TIMEOUT_S
 const uint32_t POLL_MS           = 500;
 const int      ANSWER_REPEATS    = 2;
 const float    LOW_BATT_PCT      = 15.0;
+const uint32_t BATT_PRINT_MS     = 60000;  // battery status line in the Serial Monitor
+const float    CHARGE_RATE_MIN   = 0.5;    // %/hour; above +this = charging, below -this = draining
 
 // ------------------------------------------------------------ globals
 Adafruit_DRV2605  drv;
@@ -183,9 +186,41 @@ void handlePress() {
   hapticError();  // local timeout
 }
 
+// ------------------------------------------------------------ battery status
+// The MAX17048 reports how fast the charge % is changing. Rising = charging.
+// It needs ~1 minute after power-up (or after plugging/unplugging USB) to settle.
+const char* chargeState(float pct, float rate) {
+  if (rate > CHARGE_RATE_MIN)  return "CHARGING";
+  if (pct >= 99.0 && rate > -CHARGE_RATE_MIN) return "FULL / on USB";
+  if (rate < -CHARGE_RATE_MIN) return "on battery (draining)";
+  return "idle (settling)";
+}
+
+void printBattery() {
+  if (!haveGauge) { Serial.println("battery: fuel gauge not found"); return; }
+  float pct = gauge.cellPercent(), v = gauge.cellVoltage(), rate = gauge.chargeRate();
+  Serial.printf("battery: %.1f%%, %.2f V, %+.1f %%/hr -> %s\n", pct, v, rate, chargeState(pct, rate));
+}
+
+// Prints a line when the state changes, plus a regular line every BATT_PRINT_MS.
+void checkBattery() {
+  static uint32_t lastCheck = 0, lastPrint = 0;
+  static String lastState = "";
+  if (!haveGauge || (lastCheck && millis() - lastCheck < 5000)) return;
+  lastCheck = millis();
+  String st = chargeState(gauge.cellPercent(), gauge.chargeRate());
+  if (st != lastState || millis() - lastPrint >= BATT_PRINT_MS) {
+    lastState = st;
+    lastPrint = millis();
+    printBattery();
+  }
+}
+
 // ------------------------------------------------------------ setup / loop
 void setup() {
   Serial.begin(115200);
+  pinMode(BUTTON_GND_PIN, OUTPUT);
+  digitalWrite(BUTTON_GND_PIN, LOW);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   Wire.begin();  // XIAO default SDA=D4, SCL=D5
 
@@ -211,6 +246,7 @@ void setup() {
   if (haveGauge && gauge.cellPercent() < LOW_BATT_PCT) hapticLowBatt();
   else hapticAck();  // "ready"
   Serial.println("Ready. Press the button, or type B + Enter here to simulate a press.");
+  Serial.println("Type S for battery / charging status.");
 }
 
 void loop() {
@@ -230,7 +266,10 @@ void loop() {
       Serial.println("--- simulated button press ---");
       handlePress();
       while (Serial.available()) Serial.read();  // ignore anything typed while busy
+    } else if (c == 'S' || c == 's') {
+      printBattery();
     }
   }
+  checkBattery();
   delay(5);
 }
