@@ -2,15 +2,20 @@
 Render server for the button -> camera -> vision -> haptic proof of concept.
 
 Flow
-  0. Camera board  WS   /camera/ws           -> stays connected; server pushes jobs down it
-  1. Button board  POST /button              -> creates the single active job (409 if one exists,
-                                                503 if the camera isn't connected) and sends
-                                                {"cmd":"capture","job_id":...} to the camera
-  3. Camera board  POST /camera/{id}/image/{rank}  (x4, raw JPEG body)
-  4. Camera board  POST /camera/{id}/submit  -> server reads all 4 images in parallel, votes
-  5. Button board  GET  /job/{id}            -> polls; when status == "done" it gets the result
-                                                and the job is closed (button accepted again)
+  0. Camera board  WS   /camera/ws   -> stays connected; server pushes jobs down it
+  1. Button board  POST /button      -> creates the single active job (409 if one exists,
+                                        503 if the camera isn't connected) and sends
+                                        {"cmd":"capture","job_id":...} to the camera
+  2. Camera board  sends each of its best 4 photos over the same WebSocket as a binary
+                   message: [1 byte rank][10 bytes job id][JPEG]. Each photo is sent to the
+                   vision model the moment it arrives, so all 4 are read at the same time.
+  3. Camera board  sends {"event":"submit","job_id":...,"count":N} when it's done sending.
+  4. The answer is decided as soon as 3 reads agree (no waiting for the 4th), or as soon
+     as 3-way agreement has become impossible (retake).
+  5. Button board  GET  /job/{id}    -> polls; when status == "done" it gets the result
+                                        and the job is closed (button accepted again)
 
+The older HTTP upload endpoints (/camera/{id}/image|submit|fail) still work.
 Only one job exists at a time. Run with ONE worker: state is in memory.
 """
 import asyncio
@@ -38,6 +43,7 @@ REQUIRED_AGREEMENT = 3
 IMAGES_EXPECTED = 4
 MAX_IMAGE_BYTES = 3_000_000
 VALID = "ABCDEFGH"
+WS_HEADER = 11  # binary image message: 1 byte rank + 10 byte job id
 
 PROMPT = """This photo shows one or more multiple-choice questions on paper or a screen.
 
@@ -58,9 +64,8 @@ Respond with ONLY this JSON, nothing else:
 client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
 app = FastAPI()
 lock = asyncio.Lock()
-job: dict | None = None    # the single active job
+job: dict | None = None             # the single active job
 camera_ws: WebSocket | None = None  # the camera board's live connection
-_tasks: set = set()        # keep references to background analysis tasks
 
 
 # ---------------------------------------------------------------- helpers
@@ -69,9 +74,16 @@ def check_key(key: str | None) -> None:
         raise HTTPException(401, "bad device key")
 
 
-def _finish_locked(outcome: str, reason: str | None = None,
-                   answer: str | None = None, votes: list | None = None) -> None:
-    """Mark the active job done. Caller must hold `lock`."""
+def _votes_list(j: dict) -> list:
+    return [j["votes"][k] for k in sorted(j["votes"])]
+
+
+def _finish_locked(outcome: str, reason: str | None = None, answer: str | None = None) -> None:
+    """Mark the active job done and stop any reads still running. Caller must hold `lock`."""
+    me = asyncio.current_task()
+    for t in job["tasks"]:
+        if t is not me and not t.done():
+            t.cancel()   # result no longer matters; saves time and API cost
     job.update(
         status="done",
         done_at=time.time(),
@@ -80,11 +92,10 @@ def _finish_locked(outcome: str, reason: str | None = None,
             "answer": answer,                         # "A".."H" or None
             "index": VALID.index(answer) + 1 if answer else 0,  # 1-based buzz count
             "reason": reason,
-            "votes": votes or [],
+            "votes": _votes_list(job),
         },
     )
-    job["images"].clear()
-    log.info("job %s done: %s", job["id"], job["result"])
+    log.info("job %s done in %.1f s: %s", job["id"], job["done_at"] - job["created"], job["result"])
 
 
 def _expire_locked() -> None:
@@ -109,11 +120,27 @@ def _get_job_locked(job_id: str) -> dict:
     return job
 
 
+def _decide_locked(j: dict) -> None:
+    """Finish early when the outcome can no longer change. Caller must hold `lock`."""
+    if j["status"] == "done":
+        return
+    counts = Counter(v for v in j["votes"].values() if v != "UNCLEAR")
+    best, n = counts.most_common(1)[0] if counts else (None, 0)
+    if n >= REQUIRED_AGREEMENT:
+        _finish_locked("answer", answer=best)
+        return
+    expected = j["expected"] if j["expected"] is not None else IMAGES_EXPECTED
+    remaining = expected - len(j["votes"])
+    if n + remaining < REQUIRED_AGREEMENT:
+        _finish_locked("retake", reason=f"agreement below {REQUIRED_AGREEMENT}/{expected}")
+
+
 async def read_one(jpeg: bytes) -> str:
     """Ask the vision model about one image. Returns a letter or 'UNCLEAR'."""
+    t0 = time.time()
     msg = await client.messages.create(
         model=MODEL,
-        max_tokens=300,
+        max_tokens=200,
         messages=[{
             "role": "user",
             "content": [
@@ -134,32 +161,57 @@ async def read_one(jpeg: bytes) -> str:
     except json.JSONDecodeError:
         log.warning("bad JSON in model reply: %r", text[:200])
         return "UNCLEAR"
-    log.info("image read: %s", data)
+    log.info("image read in %.1f s: %s", time.time() - t0, data)
     ans = str(data.get("answer", "UNCLEAR")).strip().upper()
     return ans if len(ans) == 1 and ans in VALID else "UNCLEAR"
 
 
-async def analyze(job_id: str, images: list[bytes]) -> None:
-    results = await asyncio.gather(*(read_one(b) for b in images), return_exceptions=True)
-    votes = []
-    for r in results:
-        if isinstance(r, Exception):
-            log.error("vision call failed: %r", r)
-            votes.append("UNCLEAR")
-        else:
-            votes.append(r)
-
-    counts = Counter(v for v in votes if v != "UNCLEAR")
+async def analyze_one(job_id: str, rank: int, jpeg: bytes) -> None:
+    try:
+        vote = await read_one(jpeg)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        log.error("vision call failed: %r", e)
+        vote = "UNCLEAR"
     async with lock:
-        if job is None or job["id"] != job_id or job["status"] != "analyzing":
-            return  # timed out or replaced meanwhile
-        if counts:
-            best, n = counts.most_common(1)[0]
-            if n >= REQUIRED_AGREEMENT:
-                _finish_locked("answer", answer=best, votes=votes)
-                return
-        _finish_locked("retake", reason=f"agreement below {REQUIRED_AGREEMENT}/{IMAGES_EXPECTED}",
-                       votes=votes)
+        if job is None or job["id"] != job_id or job["status"] == "done":
+            return
+        job["votes"][rank] = vote
+        _decide_locked(job)
+
+
+def _add_image_locked(j: dict, rank: int, data: bytes) -> str | None:
+    """Start reading one image right away. Returns an error string or None."""
+    if j["status"] == "done":
+        return "job already finished"
+    if not 0 <= rank < IMAGES_EXPECTED:
+        return "rank out of range"
+    if len(data) > MAX_IMAGE_BYTES:
+        return "image too large"
+    if not data.startswith(b"\xff\xd8"):
+        return "not a JPEG"
+    if rank in j["received"]:
+        return None  # duplicate; ignore
+    j["received"].add(rank)
+    if j["first_image_at"] is None:
+        j["first_image_at"] = time.time()
+        log.info("job %s first photo after %.1f s", j["id"], j["first_image_at"] - j["created"])
+    task = asyncio.create_task(analyze_one(j["id"], rank, data))
+    j["tasks"].append(task)
+    return None
+
+
+def _submit_locked(j: dict) -> None:
+    """Camera has sent everything it's going to send."""
+    if j["status"] == "done":
+        return
+    j["expected"] = len(j["received"])
+    log.info("job %s: camera sent %d photos", j["id"], j["expected"])
+    if j["expected"] < REQUIRED_AGREEMENT:
+        _finish_locked("retake", reason=f"only {j['expected']} images received")
+        return
+    _decide_locked(j)
 
 
 # ---------------------------------------------------------------- routes
@@ -167,7 +219,7 @@ async def analyze(job_id: str, images: list[bytes]) -> None:
 async def health():
     async with lock:
         _expire_locked()
-        return {"ok": True, "camera_connected": camera_ws is not None,
+        return {"ok": True, "camera_connected": camera_ws is not None, "model": MODEL,
                 "active_job": None if job is None else
                 {"id": job["id"], "status": job["status"]}}
 
@@ -197,18 +249,62 @@ async def button(request: Request, x_device_key: str | None = Header(None)):
             raise HTTPException(503, {"camera": "unreachable"})
         job = {
             "id": new_id,
-            "status": "claimed",          # claimed -> analyzing -> done
+            "status": "capturing",       # capturing -> done
             "created": time.time(),
-            "images": {},
+            "first_image_at": None,
+            "received": set(),           # ranks received
+            "votes": {},                 # rank -> letter / "UNCLEAR"
+            "expected": None,            # set when the camera says it's done sending
+            "tasks": [],
             "battery_pct": body.get("battery_pct"),
         }
         log.info("job %s created and sent to camera (battery %s%%)", new_id, job["battery_pct"])
         return {"job_id": new_id}
 
 
+async def _handle_ws_bytes(data: bytes) -> None:
+    if len(data) <= WS_HEADER:
+        log.warning("short binary message from camera (%d bytes)", len(data))
+        return
+    rank = data[0]
+    job_id = data[1:WS_HEADER].decode("ascii", "replace")
+    jpeg = data[WS_HEADER:]
+    async with lock:
+        _expire_locked()
+        if job is None or job["id"] != job_id:
+            log.warning("photo for unknown job %s ignored", job_id)
+            return
+        err = _add_image_locked(job, rank, jpeg)
+        if err:
+            log.warning("job %s photo %d rejected: %s", job_id, rank, err)
+        else:
+            log.info("job %s photo %d received (%d bytes), reading now", job_id, rank, len(jpeg))
+
+
+async def _handle_ws_text(text: str) -> None:
+    try:
+        msg = json.loads(text)
+    except json.JSONDecodeError:
+        log.info("camera says: %s", text[:200])
+        return
+    event = msg.get("event")
+    job_id = msg.get("job_id")
+    if event in ("submit", "fail"):
+        async with lock:
+            _expire_locked()
+            if job is None or job["id"] != job_id:
+                return
+            if event == "submit":
+                _submit_locked(job)
+            elif job["status"] != "done":
+                _finish_locked("retake", reason=msg.get("reason", "camera failure"))
+        return
+    log.info("camera says: %s", text[:200])
+
+
 @app.websocket("/camera/ws")
 async def camera_socket(ws: WebSocket):
-    """Camera board keeps this open. Jobs are pushed down it as {"cmd":"capture",...}."""
+    """Camera board keeps this open. Jobs go down it; photos and status come back up it."""
     global camera_ws
     if not DEVICE_KEY or ws.headers.get("x-device-key") != DEVICE_KEY:
         await ws.close(code=1008)
@@ -223,8 +319,13 @@ async def camera_socket(ws: WebSocket):
     log.info("camera connected")
     try:
         while True:
-            msg = await ws.receive_text()   # camera sends small status messages; just log them
-            log.info("camera says: %s", msg[:200])
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            if msg.get("bytes") is not None:
+                await _handle_ws_bytes(msg["bytes"])
+            elif msg.get("text") is not None:
+                await _handle_ws_text(msg["text"])
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -235,22 +336,17 @@ async def camera_socket(ws: WebSocket):
             log.info("camera disconnected")
 
 
+# ---- older HTTP upload path (still supported)
 @app.post("/camera/{job_id}/image/{rank}")
 async def camera_image(job_id: str, rank: int, request: Request,
                        x_device_key: str | None = Header(None)):
     check_key(x_device_key)
-    if not 0 <= rank < IMAGES_EXPECTED:
-        raise HTTPException(400, "rank out of range")
     data = await request.body()
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(413, "image too large")
-    if not data.startswith(b"\xff\xd8"):
-        raise HTTPException(400, "not a JPEG")
     async with lock:
         j = _get_job_locked(job_id)
-        if j["status"] != "claimed":
-            raise HTTPException(409, f"job is {j['status']}")
-        j["images"][rank] = data
+        err = _add_image_locked(j, rank, data)
+        if err:
+            raise HTTPException(400, err)
     return {"ok": True, "received": rank, "bytes": len(data)}
 
 
@@ -259,17 +355,8 @@ async def camera_submit(job_id: str, x_device_key: str | None = Header(None)):
     check_key(x_device_key)
     async with lock:
         j = _get_job_locked(job_id)
-        if j["status"] != "claimed":
-            raise HTTPException(409, f"job is {j['status']}")
-        images = [j["images"][k] for k in sorted(j["images"])]
-        if len(images) < REQUIRED_AGREEMENT:
-            _finish_locked("retake", reason=f"only {len(images)} images received")
-            return {"ok": True, "status": "done"}
-        j["status"] = "analyzing"
-    task = asyncio.create_task(analyze(job_id, images))
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
-    return {"ok": True, "status": "analyzing", "images": len(images)}
+        _submit_locked(j)
+        return {"ok": True, "status": j["status"]}
 
 
 @app.post("/camera/{job_id}/fail")

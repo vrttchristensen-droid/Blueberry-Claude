@@ -5,23 +5,23 @@
     Board: "XIAO_ESP32S3"
     PSRAM: "OPI PSRAM"   <-- required
   Libraries: ArduinoJson (v7), "WebSockets" by Markus Sattler.
-             esp_camera / img_converters ship with the ESP32 core.
+             esp_camera ships with the ESP32 core.
 
-  Per job:
+  Per job (everything below is OFF between jobs to keep the board cool):
     1. Stay connected to the server over a WebSocket; the server pushes
        {"cmd":"capture","job_id":...} when the button is pressed
-    2. Take 8 photos, save all to /jobs/<id>/img_N.jpg
-    3. Score each by text sharpness (variance of the Laplacian on a
-       half-resolution decode) and log scores to /jobs/<id>/scores.txt
-    4. Upload the 4 sharpest, then POST /submit
-    5. On any failure POST /fail so the user gets the retake pattern
+    2. Fast mode on (240 MHz CPU, full-speed Wi-Fi), camera on, short exposure settle
+    3. Burst: 8 photos straight into memory, then the camera is put to sleep and turned off
+    4. Rank by sharpness (JPEG size: in a burst of the same scene, the sharper frame
+       keeps more fine detail and compresses less, so it's bigger) and send the best 4
+       over the already-open WebSocket. The server starts reading each one as it arrives.
+    5. While the server reads them, save all 8 + scores.txt to the SD card
+       (card mounted only for this step), then back to low-power idle (80 MHz).
+    6. On any failure tell the server so the user gets the retake pattern
 */
 #include "esp_camera.h"
-#include "img_converters.h"
 #include "esp_heap_caps.h"
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <SD.h>
 #include <SPI.h>
 #include <ArduinoJson.h>
@@ -41,17 +41,19 @@ const char* DEVICE_KEY = "change-me";
 
 const int      SHOTS       = 8;
 const int      KEEP        = 4;
-const int      SHOT_GAP_MS = 150;      // small gap -> slightly different frames
-const uint32_t WARMUP_MS   = 1200;     // auto-exposure settle time after powering the camera
+const int      MIN_UPLOADS = 3;        // server needs 3/4 agreement anyway
+const uint32_t WARMUP_MS   = 800;      // auto-exposure settle time; raise if photos come out dark
+const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is max for OV3660
+const framesize_t STREAM_FRAME = FRAMESIZE_VGA;  // live view: 640x480 keeps it smooth
+
+const uint32_t CPU_FAST_MHZ = 240;     // during a job / live view
+const uint32_t CPU_IDLE_MHZ = 80;      // between jobs (lowest speed Wi-Fi supports)
 
 // Heat guard (ESP32-S3 internal sensor, approximate). Type T in the Serial Monitor to read it.
 const float TEMP_WARN_C   = 70.0;      // above this: live view is switched off / refused
 const float TEMP_STOP_C   = 80.0;      // above this: jobs are refused (user gets retake buzz)
 const float TEMP_RESUME_C = 70.0;      // jobs allowed again once it cools below this
 const uint32_t TEMP_PRINT_MS = 30000;  // how often to print the temperature
-const int      MIN_UPLOADS = 3;        // server needs 3/4 agreement anyway
-const framesize_t FRAME    = FRAMESIZE_UXGA;  // 1600x1200; QXGA (2048x1536) is max for OV3660
-const framesize_t STREAM_FRAME = FRAMESIZE_VGA;  // live view: 640x480 keeps it smooth
 
 #define SD_CS 21
 
@@ -73,9 +75,18 @@ const framesize_t STREAM_FRAME = FRAMESIZE_VGA;  // live view: 640x480 keeps it 
 #define HREF_GPIO_NUM  47
 #define PCLK_GPIO_NUM  13
 
-WiFiClientSecure tls;
+const size_t WS_HEADER = 11;   // binary photo message: 1 byte rank + 10 byte job id + JPEG
+
 WebSocketsClient ws;
 String pendingJob;   // set by the WebSocket handler, run from loop()
+
+// ------------------------------------------------------------ power
+// Fast = full CPU speed and Wi-Fi power saving off (much quicker uploads).
+// Idle = 80 MHz CPU and Wi-Fi modem sleep: far less heat while waiting for a press.
+void setFast(bool fast) {
+  setCpuFrequencyMhz(fast ? CPU_FAST_MHZ : CPU_IDLE_MHZ);
+  WiFi.setSleep(!fast);
+}
 
 // ------------------------------------------------------------ camera
 bool initCamera(framesize_t size = FRAME) {
@@ -115,6 +126,14 @@ bool initCamera(framesize_t size = FRAME) {
     s->set_saturation(s, -2);       // text doesn't need color
   }
   return true;
+}
+
+// The Sense board has no camera power-down pin, so put the sensor into its own
+// software standby before releasing it. (The next init resets and wakes it.)
+void cameraOff() {
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) s->set_reg(s, 0x3008, 0xff, 0x42);   // OV3660 SYSTEM_CTROL0: software power-down
+  esp_camera_deinit();
 }
 
 // ------------------------------------------------------------ live view (type F = start, G = stop)
@@ -197,7 +216,7 @@ void streamCameraOn() {
 
 void streamCameraOff() {
   xSemaphoreTake(camLock, portMAX_DELAY);
-  if (camOn) { esp_camera_deinit(); camOn = false; }
+  if (camOn) { cameraOff(); camOn = false; }
   xSemaphoreGive(camLock);
 }
 
@@ -211,10 +230,10 @@ void startLiveView() {
     return;
   }
   if (!streaming) {
+    setFast(true);         // full speed for video
     startServers();
     streamCameraOn();
-    if (!camOn) { Serial.println("live view: camera failed to start"); return; }
-    WiFi.setSleep(false);  // full Wi-Fi speed for video
+    if (!camOn) { Serial.println("live view: camera failed to start"); setFast(false); return; }
     streaming = true;
   }
   Serial.printf("LIVE VIEW ON: open http://%s/ in a browser on the same Wi-Fi. Type G to stop.\n",
@@ -226,39 +245,8 @@ void stopLiveView() {
   streaming = false;
   delay(200);              // let the stream task notice and let go of the camera
   streamCameraOff();
-  WiFi.setSleep(true);
+  setFast(false);
   Serial.println("live view off");
-}
-
-// Variance of the Laplacian on the green channel of a half-res decode.
-// Higher = crisper edges = more readable text. Returns -1 on failure.
-float sharpness(camera_fb_t* fb) {
-  const int w = fb->width / 2, h = fb->height / 2;
-  uint8_t* buf = (uint8_t*)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
-  if (!buf) return -1;
-  if (!jpg2rgb565(fb->buf, fb->len, buf, JPG_SCALE_2X)) { heap_caps_free(buf); return -1; }
-
-  // RGB565 is written big-endian by jpg2rgb565; green = 6 bits, a decent luma proxy
-  auto G = [&](int x, int y) -> int {
-    const uint8_t* p = buf + ((size_t)y * w + x) * 2;
-    uint16_t px = ((uint16_t)p[0] << 8) | p[1];
-    return (px >> 5) & 0x3F;
-  };
-
-  double sum = 0, sum2 = 0;
-  size_t n = 0;
-  for (int y = 1; y < h - 1; y++) {
-    for (int x = 1; x < w - 1; x++) {
-      int lap = 4 * G(x, y) - G(x - 1, y) - G(x + 1, y) - G(x, y - 1) - G(x, y + 1);
-      sum += lap;
-      sum2 += (double)lap * lap;
-      n++;
-    }
-  }
-  heap_caps_free(buf);
-  if (!n) return -1;
-  double mean = sum / n;
-  return (float)(sum2 / n - mean * mean);
 }
 
 // ------------------------------------------------------------ network
@@ -292,121 +280,125 @@ bool ensureWifi(uint32_t timeoutMs = 10000) {
   return false;
 }
 
-int httpJson(const char* method, const String& path, const String& body, String& out,
-             uint32_t timeoutMs = 10000) {
-  HTTPClient http;
-  http.setTimeout(timeoutMs);
-  http.setReuse(false);  // ask the server to close the connection after each reply
-  if (!http.begin(tls, String(SERVER) + path)) return -1;
-  http.addHeader("X-Device-Key", DEVICE_KEY);
-  int code;
-  if (body.length()) {
-    http.addHeader("Content-Type", "application/json");
-    code = http.sendRequest(method, body);
-  } else {
-    code = http.sendRequest(method);
-  }
-  // 204 has no body: reading one would hang until the timeout
-  out = (code > 0 && code != 204) ? http.getString() : "";
-  http.end();
-  return code;
-}
-
-bool uploadFile(const String& id, int rank, const String& path) {
-  for (int attempt = 0; attempt < 3; attempt++) {
-    File f = SD.open(path, FILE_READ);
-    if (!f) return false;
-    HTTPClient http;
-    http.setTimeout(20000);
-    if (!http.begin(tls, String(SERVER) + "/camera/" + id + "/image/" + rank)) { f.close(); continue; }
-    http.addHeader("X-Device-Key", DEVICE_KEY);
-    http.addHeader("Content-Type", "image/jpeg");
-    int code = http.sendRequest("POST", &f, f.size());
-    Serial.printf("upload rank %d (%s, %u B) -> %d\n", rank, path.c_str(), (unsigned)f.size(), code);
-    http.end();
-    f.close();
-    if (code == 200) return true;
-    if (code == 404 || code == 409) return false;  // job gone / wrong state: don't retry
-    delay(300);
-  }
-  return false;
-}
-
 void reportFail(const String& id, const char* reason) {
-  String resp;
-  httpJson("POST", "/camera/" + id + "/fail", String("{\"reason\":\"") + reason + "\"}", resp);
+  String msg = String("{\"event\":\"fail\",\"job_id\":\"") + id + "\",\"reason\":\"" + reason + "\"}";
+  ws.sendTXT(msg);
 }
 
 // ------------------------------------------------------------ job
-void runJob(const String& id) {
-  Serial.printf("== job %s ==\n", id.c_str());
+// Each shot is stored with WS_HEADER bytes of room in front, so it can be sent as-is.
+uint8_t* shotBuf[SHOTS];
+size_t   shotLen[SHOTS];
+
+void freeShots() {
+  for (int i = 0; i < SHOTS; i++) {
+    if (shotBuf[i]) heap_caps_free(shotBuf[i]);
+    shotBuf[i] = nullptr;
+    shotLen[i] = 0;
+  }
+}
+
+// Saves all 8 photos + scores to /jobs/<id>/. The card is only mounted for this.
+void saveToSd(const String& id, const int* order) {
+  uint32_t t0 = millis();
+  if (!SD.begin(SD_CS)) { Serial.println("SD: mount failed, photos not saved"); return; }
   String dir = "/jobs/" + id;
   SD.mkdir("/jobs");
   SD.mkdir(dir);
+  int saved = 0;
+  for (int i = 0; i < SHOTS; i++) {
+    if (!shotBuf[i]) continue;
+    File f = SD.open(dir + "/img_" + i + ".jpg", FILE_WRITE);
+    if (!f) continue;
+    if (f.write(shotBuf[i] + WS_HEADER, shotLen[i]) == shotLen[i]) saved++;
+    f.close();
+  }
+  File log = SD.open(dir + "/scores.txt", FILE_WRITE);
+  if (log) {
+    log.println("ranked by JPEG size (bigger = more fine detail = sharper); top 4 were sent");
+    for (int r = 0; r < SHOTS; r++)
+      log.printf("rank %d: img_%d %u bytes%s\n", r, order[r], (unsigned)shotLen[order[r]],
+                 r < KEEP && shotLen[order[r]] ? "  <- sent" : "");
+    log.close();
+  }
+  SD.end();
+  Serial.printf("SD: saved %d photos in %lu ms\n", saved, (unsigned long)(millis() - t0));
+}
 
-  // Camera is powered only while capturing (it runs very hot if left streaming)
-  if (!initCamera()) { reportFail(id, "camera init failed"); return; }
+void runJob(const String& id) {
+  uint32_t t0 = millis();
+  Serial.printf("== job %s ==\n", id.c_str());
+  setFast(true);
 
-  // Let auto-exposure / white balance settle before the real shots
+  if (!initCamera()) { reportFail(id, "camera init failed"); setFast(streaming); return; }
+
+  // Let auto-exposure / white balance settle before the burst
   uint32_t warm = millis();
   while (millis() - warm < WARMUP_MS) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
 
-  float score[SHOTS];
-  int saved = 0;
+  // Burst: 8 frames straight into memory, nothing else in between
+  uint32_t tBurst = millis();
+  int captured = 0;
   for (int i = 0; i < SHOTS; i++) {
-    score[i] = -1;
+    shotBuf[i] = nullptr;
+    shotLen[i] = 0;
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) { Serial.printf("shot %d: capture failed\n", i); continue; }
-
-    String path = dir + "/img_" + i + ".jpg";
-    File f = SD.open(path, FILE_WRITE);
-    if (f) {
-      size_t wrote = f.write(fb->buf, fb->len);
-      f.close();
-      if (wrote == fb->len) {
-        score[i] = sharpness(fb);
-        saved++;
-      }
+    uint8_t* b = (uint8_t*)heap_caps_malloc(WS_HEADER + fb->len, MALLOC_CAP_SPIRAM);
+    if (b) {
+      memcpy(b + WS_HEADER, fb->buf, fb->len);
+      shotBuf[i] = b;
+      shotLen[i] = fb->len;
+      captured++;
     }
-    Serial.printf("shot %d: %u B, sharpness %.1f\n", i, (unsigned)fb->len, score[i]);
     esp_camera_fb_return(fb);
-    delay(SHOT_GAP_MS);
   }
-  esp_camera_deinit();  // camera off again; uploads don't need it
+  cameraOff();   // camera asleep and released as soon as the burst is done
+  Serial.printf("burst: %d photos in %lu ms (camera on for %lu ms)\n", captured,
+                (unsigned long)(millis() - tBurst), (unsigned long)(millis() - warm));
 
-  // Rank indices by sharpness, best first
+  // Rank by JPEG size, biggest (sharpest) first
   int order[SHOTS];
   for (int i = 0; i < SHOTS; i++) order[i] = i;
   for (int i = 1; i < SHOTS; i++) {
     int k = order[i], j = i - 1;
-    while (j >= 0 && score[order[j]] < score[k]) { order[j + 1] = order[j]; j--; }
+    while (j >= 0 && shotLen[order[j]] < shotLen[k]) { order[j + 1] = order[j]; j--; }
     order[j + 1] = k;
   }
 
-  File log = SD.open(dir + "/scores.txt", FILE_WRITE);
-  if (log) {
-    for (int r = 0; r < SHOTS; r++) log.printf("rank %d: img_%d sharpness %.1f\n", r, order[r], score[order[r]]);
-    log.close();
+  if (captured < MIN_UPLOADS) {
+    reportFail(id, "capture failed");
+  } else {
+    // Send the best 4 over the open connection; the server starts reading each on arrival
+    uint32_t tSend = millis();
+    int sent = 0;
+    for (int r = 0; r < SHOTS && sent < KEEP; r++) {
+      int i = order[r];
+      if (!shotBuf[i]) break;
+      shotBuf[i][0] = (uint8_t)sent;                    // rank 0..3
+      memcpy(shotBuf[i] + 1, id.c_str(), 10);           // job id (always 10 chars)
+      bool ok = ws.sendBIN(shotBuf[i], WS_HEADER + shotLen[i]);
+      Serial.printf("sent photo %d (img_%d, %u B): %s\n", sent, i, (unsigned)shotLen[i], ok ? "ok" : "FAILED");
+      if (ok) sent++;
+      ws.loop();
+    }
+    if (sent < MIN_UPLOADS) {
+      reportFail(id, "upload failed");
+    } else {
+      String submit = String("{\"event\":\"submit\",\"job_id\":\"") + id + "\",\"count\":" + sent + "}";
+      ws.sendTXT(submit);
+    }
+    Serial.printf("upload: %d photos in %lu ms (press -> sent: %lu ms)\n", sent,
+                  (unsigned long)(millis() - tSend), (unsigned long)(millis() - t0));
   }
 
-  if (saved < MIN_UPLOADS) { reportFail(id, "capture failed"); return; }
-
-  int uploaded = 0;
-  for (int r = 0; r < SHOTS && uploaded < KEEP; r++) {
-    int i = order[r];
-    if (score[i] < 0) break;
-    if (uploadFile(id, uploaded, dir + "/img_" + i + ".jpg")) uploaded++;
-    ws.loop();  // keep the server connection alive between uploads
-  }
-
-  if (uploaded < MIN_UPLOADS) { reportFail(id, "upload failed"); return; }
-
-  String resp;
-  int code = httpJson("POST", "/camera/" + id + "/submit", "", resp);
-  Serial.printf("submit -> %d %s\n", code, resp.c_str());
+  // The server is reading the photos now; save all 8 meanwhile
+  saveToSd(id, order);
+  freeShots();
+  setFast(streaming);   // back to low-power idle (unless live view is on)
 }
 
 // ------------------------------------------------------------ server connection
@@ -436,24 +428,26 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
 void setup() {
   Serial.begin(115200);
   camLock = xSemaphoreCreateMutex();
-  if (!initCamera()) { delay(3000); ESP.restart(); }  // check the camera works...
-  esp_camera_deinit();                                  // ...then keep it off until a job
-  if (!SD.begin(SD_CS)) { Serial.println("SD mount failed (FAT32?)"); delay(3000); ESP.restart(); }
+  for (int i = 0; i < SHOTS; i++) shotBuf[i] = nullptr;
 
-  tls.setInsecure();  // proof of concept: skips certificate check (see README)
+  if (!initCamera()) { delay(3000); ESP.restart(); }  // check the camera works...
+  cameraOff();                                          // ...then keep it off until a job
+  if (SD.begin(SD_CS)) { Serial.println("SD card OK"); SD.end(); }  // check, then unmount
+  else Serial.println("WARNING: SD mount failed (FAT32?). Jobs still work; photos won't be saved.");
+
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);   // modem sleep: much cooler, WebSocket still works
+  setFast(false);        // low-power idle
   ensureWifi(15000);
 
   String host = String(SERVER);
   host.replace("https://", "");
   host.replace("/", "");
-  ws.beginSSL(host.c_str(), 443, "/camera/ws");
+  ws.beginSSL(host.c_str(), 443, "/camera/ws");   // proof of concept: no certificate check
   ws.setExtraHeaders((String("X-Device-Key: ") + DEVICE_KEY).c_str());
   ws.onEvent(onWsEvent);
   ws.setReconnectInterval(3000);
   ws.enableHeartbeat(15000, 5000, 2);   // ping every 15 s; drop + reconnect if 2 pongs missed
-  Serial.println("camera board ready. Type F for live view, G to stop it.");
+  Serial.println("camera board ready. Type F for live view, G to stop it, T for temperature.");
 }
 
 // Reads the chip temperature every 2 s and applies the heat guard.
@@ -496,8 +490,6 @@ void loop() {
     if (wasStreaming) streamCameraOff();   // full-res capture needs the camera to itself
     runJob(id);
     if (wasStreaming && streaming) streamCameraOn();
-    String done = "{\"event\":\"job_finished\",\"job_id\":\"" + id + "\"}";
-    ws.sendTXT(done);
   }
 
   while (Serial.available()) {
@@ -507,4 +499,5 @@ void loop() {
     else if (c == 'T' || c == 't') Serial.printf("temp: %.0f C%s\n", temperatureRead(),
                                                  tooHot ? " (too hot, jobs paused)" : "");
   }
+  delay(10);   // let the CPU idle between checks instead of spinning flat out
 }

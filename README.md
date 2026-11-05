@@ -7,10 +7,11 @@ ranking), and a **Render server** (job lock, vision, voting).
 button press ──POST /button──▶ server creates job (rejects new presses while one exists)
                                    │
 server ──pushes "capture" over the camera's open WebSocket──▶ camera board
-   takes 8 photos → SD card → ranks by sharpness → uploads best 4 → POST /submit
+   burst of 8 photos into memory → camera off → ranks by sharpness (JPEG size)
+   → sends best 4 over the same WebSocket → saves all 8 to SD while the server works
                                    │
-server: 4 parallel vision reads → each returns a letter or UNCLEAR
-        ≥3 agree → answer   |   otherwise → retake
+server: starts reading each photo the moment it arrives (all 4 in parallel)
+        3 agree → answer immediately   |   3-way agreement impossible → retake
                                    │
 button board ──GET /job/{id} (polling)──▶ gets result → vibrates → job closed
 ```
@@ -26,6 +27,9 @@ button board ──GET /job/{id} (polling)──▶ gets result → vibrates →
    for 24/7.
 
 Optional env vars: `CLAUDE_MODEL`, `JOB_TIMEOUT_S` (90), `RESULT_HOLD_S` (120).
+`CLAUDE_MODEL=claude-haiku-5-5` reads photos noticeably faster but is less accurate on hard
+questions; the default is `claude-sonnet-5-5`. Render's logs show `image read in X s` for each
+photo and `job ... done in X s` for the whole job, so you can compare.
 
 Opening the service URL shows `camera_connected: true` when the camera board's WebSocket is up.
 
@@ -54,7 +58,11 @@ Install the **WebSockets** library by Markus Sattler. Set PSRAM to **OPI PSRAM**
 After the first job, pull the SD card and check `/jobs/<id>/`:
 - images upright and not mirrored? If not, change `set_vflip` / `set_hmirror`.
   This matters, because "topmost question" is judged from the image.
-- `scores.txt` shows the sharpness ranking; the top 4 should be the readable ones.
+- `scores.txt` shows the sharpness ranking (by JPEG size); the top 4 are the ones that were sent.
+
+Power: between jobs the camera sensor is in standby and released, the SD card is unmounted, the
+CPU runs at 80 MHz and Wi-Fi uses modem sleep. A job switches to 240 MHz and full-speed Wi-Fi.
+If photos come out dark, raise `WARMUP_MS` (800 ms).
 
 ## Haptic patterns
 
