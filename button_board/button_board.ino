@@ -58,38 +58,38 @@ bool haveHaptic = false;
 WiFiClientSecure tls;
 
 // ------------------------------------------------------------ haptics
-void waitHaptic() {
-  uint32_t t = millis();
-  while ((drv.readRegister8(DRV2605_REG_GO) & 0x01) && millis() - t < 2000) delay(5);
+// Every pattern is driven directly at full strength (real-time mode),
+// same as the hold-to-buzz test. Lower VIB_STRENGTH (0..0x7F) to soften everything.
+const uint8_t VIB_STRENGTH = 0x7F;   // 0x7F = max
+
+// One buzz of `onMs` at full strength.
+void pulse(int onMs) {
+  if (!haveHaptic) { delay(onMs); return; }
+  drv.setRealtimeValue(VIB_STRENGTH);
+  delay(onMs);
+  drv.setRealtimeValue(0);
 }
 
-void effect(uint8_t e) {
-  if (!haveHaptic) return;
-  drv.setWaveform(0, e);
-  drv.setWaveform(1, 0);   // end of sequence
-  drv.go();
-  waitHaptic();
-}
-
-void repeatEffect(uint8_t e, int n, int gapMs) {
+// `n` buzzes of `onMs`, with `gapMs` of stillness between them.
+void pulses(int n, int onMs, int gapMs) {
   for (int i = 0; i < n; i++) {
-    effect(e);
+    pulse(onMs);
     if (i < n - 1) delay(gapMs);
   }
 }
 
 // Every pattern is also printed, so the board works with nothing wired to it
-void hapticAck()     { Serial.println("[haptic] tick (accepted/ready)");      effect(24); }
-void hapticRetake()  { Serial.println("[haptic] RETAKE (2 long buzzes)");     repeatEffect(15, 2, 300); }
-void hapticBusy()    { Serial.println("[haptic] BUSY (1 very long buzz)");    effect(16); }
-void hapticError()   { Serial.println("[haptic] ERROR (4 rapid buzzes)");     repeatEffect(47, 4, 120); }
-void hapticLowBatt() { Serial.println("[haptic] LOW BATTERY (3 pulses)");     repeatEffect(52, 3, 200); }
+void hapticAck()     { Serial.println("[haptic] tick (accepted/ready)");      pulse(80); }
+void hapticRetake()  { Serial.println("[haptic] RETAKE (2 long buzzes)");     pulses(2, 750, 300); }
+void hapticBusy()    { Serial.println("[haptic] BUSY (1 very long buzz)");    pulse(1000); }
+void hapticError()   { Serial.println("[haptic] ERROR (4 rapid buzzes)");     pulses(4, 100, 120); }
+void hapticLowBatt() { Serial.println("[haptic] LOW BATTERY (3 pulses)");     pulses(3, 250, 200); }
 
 void hapticAnswer(int index) {                       // 1-based
   Serial.printf("[haptic] ANSWER %c (%d clicks)\n", 'A' + index - 1, index);
   delay(800);  // gap so the ack tick isn't counted as a click
   for (int r = 0; r < ANSWER_REPEATS; r++) {
-    repeatEffect(1, index, 350);                     // Strong Click 100%
+    pulses(index, 150, 350);                         // one clear click per letter
     if (r < ANSWER_REPEATS - 1) delay(2000);
   }
 }
@@ -206,6 +206,16 @@ bool usbPlugged() {
 #endif
 }
 
+// Orange user LED: ON while running on battery (no USB host), OFF on USB.
+#define BATT_LED_PIN LED_BUILTIN   // XIAO ESP32-S3: on when LOW
+
+void updateBatteryLed() {
+  static uint32_t lastCheck = 0;
+  if (lastCheck && millis() - lastCheck < 500) return;
+  lastCheck = millis();
+  digitalWrite(BATT_LED_PIN, usbPlugged() ? HIGH : LOW);
+}
+
 void printUsbPower() {
   Serial.printf("power: %s\n", usbPlugged() ? "on USB (charging or full)" : "on battery");
 }
@@ -243,13 +253,16 @@ void setup() {
   pinMode(BUTTON_GND_PIN, OUTPUT);
   digitalWrite(BUTTON_GND_PIN, LOW);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BATT_LED_PIN, OUTPUT);
+  digitalWrite(BATT_LED_PIN, HIGH);   // off until the first check
   Wire.begin();  // XIAO default SDA=D4, SCL=D5
 
   haveHaptic = drv.begin();
   if (haveHaptic) {
     if (MOTOR_IS_LRA) { drv.useLRA(); drv.selectLibrary(6); }
     else              { drv.useERM(); drv.selectLibrary(1); }
-    drv.setMode(DRV2605_MODE_INTTRIG);
+    drv.setMode(DRV2605_MODE_REALTIME);   // direct strength control, used by pulse()
+    drv.setRealtimeValue(0);              // motor off
   } else {
     Serial.println("DRV2605L not found");
   }
@@ -292,5 +305,6 @@ void loop() {
     }
   }
   checkBattery();
+  updateBatteryLed();
   delay(5);
 }
